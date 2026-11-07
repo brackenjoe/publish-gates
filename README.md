@@ -241,6 +241,12 @@ Through some proxies a private repo can answer 200 and a public one 403; a
 All offline, bash. `test-scan.sh` needs the scanner tools above; the others
 need only git.
 
+The tests' fixtures hold email-shaped strings on purpose (`t@example.invalid`
+as the temp repos' author, the `git@` URL form), so `public-scan.sh .` run on
+this clone flags them. That is the scanner working; a repo that ships such
+fixtures lists them in a `PUBLIC_SCAN_ALLOW` file, as this one's publisher
+does.
+
 ## Licence
 
 GPL-3.0-or-later, Copyright (C) 2026 Joe Fernandez. See [LICENSE](LICENSE).

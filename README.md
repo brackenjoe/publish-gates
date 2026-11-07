@@ -5,7 +5,9 @@ scanner, a git hook that refuses commit messages GitHub would turn into
 cross-references, a pre-push hook that stops a push to a public remote
 unless the owner approved it, a scan of a directory for addresses, names and
 credential shapes before it goes anywhere public, and a check of whether a
-GitHub repo is public. Shell only; each gate is one file. They were written
+GitHub repo is public, and a check that photos and video carry no
+location or device metadata. Each gate is one file, shell except the media
+gate, which is Python. They were written
 for a machine where an AI coding agent commits and pushes on its own, and
 they catch mistakes, not a hostile contributor: every one of them can be
 bypassed by someone who means to.
@@ -17,6 +19,7 @@ bypassed by someone who means to.
 | `git-hooks/commit-msg` | on `git commit` in a private repo | a message holding `owner/repo#N`, `owner/repo@sha` or a github.com issue, pull, commit or discussions URL: GitHub posts the commit's title on that public item's timeline, which leaks a private repo's history one line at a time |
 | `git-hooks/pre-push` | on every `git push` to github.com | the same cross-references in any commit being pushed, unless the target repo is known public (the gate behind `commit-msg`, which git skips for `-n`, cherry-pick, rebase and `am`); and any push to a GitHub repo that is not known private, unless `GATES_PUBLIC_PUSH_OK=yes` is on the command |
 | `public-scan.sh DIR` | by hand, before a directory goes public | IPv4, IPv6 and MAC addresses, Tailscale names, email addresses, phone numbers, token and key shapes of a dozen vendors, private key blocks, passwords in assignments and URLs, and your own list of private terms |
+| `check-media-metadata.py PATH...` | by hand, before photos or video go public | location and device metadata: every image and video is read by its bytes against a per-format allow-list of segments, chunks, boxes and tags, and what is not on the list is refused, the tag named and never its value |
 | `check-visibility.sh OWNER REPO` | from `pre-push`, or by hand | prints `public`, `private` or `ask`; an answer it cannot settle is `ask`, not `private` (a 404, which is also what a misspelt name gets, is `private`: see below) |
 
 ## Setup
@@ -28,9 +31,11 @@ so they stay out of `git status` (the repo ships no `.gitignore`, so that
 your own copy decides).
 
 **Requirements:** bash 4 or later (`scan.sh` uses associative arrays; macOS
-ships 3.2), GNU grep with PCRE (`grep -P`; `public-scan.sh` checks at start
+ships 3.2), Python 3.7 or later for `check-media-metadata.py`, GNU grep with PCRE (`grep -P`; `public-scan.sh` checks at start
 and exits 2 without it), git 2.31 or later (`rev-parse --path-format`),
 coreutils `timeout` for `scan.sh --deps`, curl for `check-visibility.sh`,
+ffprobe (ffmpeg) for `check-media-metadata.py` when a video is present
+(and ffmpeg with libx264, libwebp and libvpx-vp9 for its test),
 perl for `public-scan.sh`'s allow list, and gitleaks 8.30.1 or later
 (`scan.sh` uses its `git` and `dir` subcommands and `--gitleaks-ignore-path`,
 verified on 8.30.1 only).
@@ -217,6 +222,39 @@ line. On a hit, every allow string is removed from the line and the rule is
 tested on what is left, so an allowed address passes and a second, different
 address on the same line still fails. Needs perl.
 
+## check-media-metadata.py
+
+    python3 -I check-media-metadata.py [-v] PATH...
+
+Each PATH is a file or a directory, walked. Every plain file is opened and
+told apart by its first bytes: JPEG, PNG, WebP, GIF, the MP4 family or
+Matroska/WebM. The name decides only two things: a camera sidecar name
+(`.srt`, `.lrv`, `.thm` and the like) is refused, and a media name over
+other bytes is refused. A symbolic link, or anything that is not a plain
+file, is refused unopened. For each format there is an allow-list of
+segments, chunks, boxes and tags, and a file is clean only if everything in
+it is on the list, so what is unknown is refused too: EXIF and XMP (which
+carry GPS and the camera), Photoshop and C2PA segments, a JPEG or GIF
+comment, a `uuid` box in any walked container, bytes behind the end of the
+image. Video is read with `ffprobe`; only a handful of container tags pass,
+`title` and `comment` among them, with their values unread, and so does a
+PNG `Title`, `Software` or `Comment` text chunk: the gate is for the tags
+that carry location and device, not for what you wrote yourself. Text files
+with the extensions `.svg .css .html .htm .xml .txt .json .js .webmanifest
+.md .markdown` are refused when they hold a `data:image/`, `data:video/` or
+`data:audio/` URI, and an `.svg` also for editor metadata (`<metadata`,
+`sodipodi:`, `inkscape:`, `xmlns:rdf`); any other file holding a NUL byte is
+refused as binary, and other text passes. One `path: reason` line per
+finding, the tag named and never its value (a value may be the
+coordinates), at most twelve per file and then one line with the count of
+the rest. Exit 0 clean, 1 a finding (a file that cannot be opened is a
+finding too), 2 usage, a PATH that does not exist or a directory that
+cannot be read, or no `ffprobe` when a video or an HEIF/AVIF image is
+present. The full allow-lists, and what the gate does not check (TIFF, Ogg,
+MPEG-TS, the content of comments), are in the file's docstring.
+`test-check-media-metadata.sh` builds a fixture for each of the main rules
+and runs it.
+
 ## check-visibility.sh
 
     check-visibility.sh OWNER REPO
@@ -237,9 +275,11 @@ Through some proxies a private repo can answer 200 and a public one 403; a
     ./test-scan.sh             # scan.sh and pre-commit, in temp repos with the real linters
     ./test-git-hooks.sh        # commit-msg and pre-push, with a stub in place of the network
     ./check-visibility.sh --selftest
+    ./test-check-media-metadata.sh   # the media gate, 53 fixture cases (needs ffmpeg)
 
-All offline, bash. `test-scan.sh` needs the scanner tools above; the others
-need only git.
+All offline, bash. `test-scan.sh` needs the scanner tools above;
+`test-check-media-metadata.sh` needs python3 and ffmpeg with ffprobe,
+libx264, libwebp and libvpx-vp9; the others need only git.
 
 The tests' fixtures hold email-shaped strings on purpose (`t@example.invalid`
 as the temp repos' author, the `git@` URL form), so `public-scan.sh .` run on

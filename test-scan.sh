@@ -45,6 +45,14 @@
 #   16 a hook run in a worktree of the repo scans that worktree's staged files;
 #      16c under an absolute hooksPath, with the main's scan.sh; 16d the public
 #      layout (scan.sh and git-hooks/ outside the scanned repo)
+#   21 type changes (T) are scanned: a T-only commit with a token is refused, a
+#      T .py with F821 is linted, a deletion-only commit is clean (0 files)
+#   22 gitleaks reads raw blobs: -diff, binary and UTF-16 working-tree-encoding
+#      cannot hide a token (--staged and --all); a tracked root .gitleaksignore
+#      holding its fingerprint does not suppress it
+#   23 --deps does not execute a venv that git tracks; symlinked pyvenv.cfg
+#   24 --deps: packages not audited are listed and keep exit 0; any skipped
+#      venv makes the run exit 2 ("incomplete")
 #   8e a tracked .gitleaksignore does not suppress; 9b a secret in a
 #      scan.exclude path is still refused by gitleaks; 10d a malformed
 #      gates.scan refuses the commit; 13h/13i --deps with no arguments searches
@@ -260,6 +268,9 @@ clean)    echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]},
 vuln)     echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[{"id":"PYSEC-1","fix_versions":["2.1"]},{"id":"PYSEC-1","fix_versions":["2.1"]}]}],"fixes":[]}'; exit 1 ;;
 pip)      echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]},{"name":"pip","version":"24.0","vulns":[{"id":"PYSEC-9","fix_versions":["26.1"]}]}],"fixes":[]}'; exit 1 ;;
 fail)     echo "ConnectionError: no network" >&2; exit 3 ;;
+execpy)   "$PIPAPI_PYTHON_LOCATION" >/dev/null 2>&1; echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]}],"fixes":[]}'; exit 0 ;;
+skipdep)  echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]},{"name":"weirdpkg","skip_reason":"Dependency not found on PyPI"}],"fixes":[]}'; exit 0 ;;
+skipmany) python3 -c 'import json; print(json.dumps({"dependencies": [{"name": "p%d" % i, "skip_reason": "x"} for i in range(1, 13)], "fixes": []}))'; exit 0 ;;
 failone)  case $PIPAPI_PYTHON_LOCATION in *v1/*) echo "boom" >&2; exit 3 ;; *) echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]}],"fixes":[]}'; exit 0 ;; esac ;;
 esac
 STUBEOF
@@ -279,7 +290,7 @@ expect "13c --deps pip-only vuln: exit 0, tooling printed" 0 '0 findings \(\+1 t
 deps fail "$TMP/v1" "$TMP/v2"
 expect "13d --deps every venv fails: exit 2, skipped" 2 'v1: skipped .*no network' 
 deps failone "$TMP/v1" "$TMP/v2"
-expect "13e --deps one skipped, one clean: exit 0" 0 'v1: skipped.*\n?.*v2: 1 packages|v2: 1 packages'
+expect "13e --deps one skipped, one clean: incomplete, exit 2" 2 'v1: skipped.*\n?.*v2: 1 packages|v2: 1 packages'
 deps clean "$R/tools/.venv-fake" "$R/work/.venv-ours"
 expect "13f --deps labels: tools/ is third-party, elsewhere ours" 0 '\[third-party\] tools/\.venv-fake:' 
 printf '%s' "$OUT" | grep -q '\[ours\] work/\.venv-ours:' || bad "13f2 ours label" "$OUT"
@@ -401,6 +412,124 @@ scan --all --verbose
 expect "20 --all --verbose prints the known finding" 0 'a\.py:2:[0-9]+: F821.*' 
 scan --all -v
 expect "20b -v is the same" 0 'a\.py:2:[0-9]+: F821'
+
+# 21 --------------------------------------------------------------------
+# Type changes (T). A symlink replaced by a regular file is staged as T, which
+# the old ACMR list dropped, so neither linters nor gitleaks saw it.
+# mktype NAME CONTENT: commit NAME as a symlink, then stage a regular file.
+mktype() {
+  ln -s elsewhere "$R/$1"; git -C "$R" add -- "$1"; git -C "$R" commit -q --no-verify -m link
+  rm -f "$R/$1"; put "$1" "$2"
+  git -C "$R" diff --cached --name-status | grep -q "^T.$1\$" || echo "fixture: $1 is not a type change" >&2
+}
+mkrepo; mktype tok.txt "token = \"ghp_${SECRET_TAIL}\""$'\n'; commit
+expect "21a type-change-only commit holding a token: refused through the hook, redacted" 1 'tok\.txt:1: github-pat' "$SECRET_TAIL"
+mkrepo; mktype t.py "$BAD_PY"; put ok.py "$CLEAN_PY"; scan --staged
+expect "21b T .py with F821 beside a clean A .py: exit 1" 1 't\.py:2:[0-9]+: F821'
+mkrepo; put a.py "$CLEAN_PY"; commit; git -C "$R" rm -q a.py; scan --staged
+expect "21c staged deletion only: clean (0 files)" 0 'scan: clean \(0 files\)'
+mkrepo; put a.py "$BAD_PY"; commit --no-verify; rm "$R/a.py"; ln -s elsewhere "$R/a.py"; git -C "$R" add a.py; scan --staged
+expect "21d file replaced by a symlink (T): skipped, not read through" 0 'scan: clean'
+
+# 22 --------------------------------------------------------------------
+# gitleaks reads raw blobs: no attribute can hide a staged or tracked token.
+TOKTXT="token = \"ghp_${SECRET_TAIL}\""$'\n'
+mkrepo; put .gitattributes $'*.txt -diff\n'; commit; put s.txt "$TOKTXT"; scan --staged
+expect "22a committed '*.txt -diff' and a token in s.txt: --staged refuses" 1 's\.txt:1: github-pat' "$SECRET_TAIL"
+commit --no-verify; scan --all
+expect "22a2 the same, --all: refuses" 1 's\.txt:1: github-pat' "$SECRET_TAIL"
+mkrepo; put .gitattributes $'*.txt -diff\n'; put s.txt "$TOKTXT"; commit
+expect "22b .gitattributes staged in the same commit: refused" 1 's\.txt:1: github-pat'
+mkrepo; put .gitattributes $'*.txt binary\n'; commit; put s.txt "$TOKTXT"; commit
+expect "22c 'binary' macro: refused" 1 's\.txt:1: github-pat'
+mkrepo; put .gitattributes $'*.txt text working-tree-encoding=UTF-16\n'; commit
+printf '%s' "$TOKTXT" | iconv -f UTF-8 -t UTF-16 >"$R/s.txt"; git -C "$R" add s.txt
+commit
+expect "22d UTF-16 working-tree-encoding file holding a token: refused" 1 's\.txt:1: github-pat'
+commit --no-verify; scan --all
+expect "22d2 the same, --all: refused" 1 's\.txt:1: github-pat'
+# A tracked root .gitleaksignore with the finding's fingerprint, in the form
+# gitleaks writes it (path:rule:line) with this path, the path relative to the
+# root, and the absolute path of a scratch copy; none may suppress.
+mkrepo; put s.txt "$TOKTXT"
+mkdir "$TMP/glx$n"; cp "$R/s.txt" "$TMP/glx$n/s.txt"
+"$GATES_GITLEAKS" dir "$TMP/glx$n" --no-banner --no-color --config "$GATES_GITLEAKS_CONFIG" -f json -r - 2>/dev/null |
+  python3 -I -c 'import json, sys
+for r in json.load(sys.stdin) or []:
+    print(r["Fingerprint"])' >"$R/.gitleaksignore"
+printf 's.txt:github-pat:1\n./s.txt:github-pat:1\n' >>"$R/.gitleaksignore"
+[ "$(wc -l <"$R/.gitleaksignore")" -ge 3 ] || bad "22e0 fingerprints" "no fingerprint read from gitleaks"
+git -C "$R" add .gitleaksignore
+scan --staged
+expect "22e tracked root .gitleaksignore with the fingerprint, token in s.txt: --staged refuses" 1 's\.txt:1: github-pat'
+commit --no-verify; scan --all
+expect "22e2 the same, --all: refuses" 1 's\.txt:1: github-pat'
+# The .gitleaksignore file is itself scanned, under its real name.
+mkrepo; put .gitleaksignore "token = \"ghp_${SECRET_TAIL}\""$'\n'; scan --staged
+expect "22f a token inside .gitleaksignore is reported under that name" 1 '(^|[^.a-z])\.gitleaksignore:1: github-pat' 'gitleaksignore\.content'
+
+# 23 --------------------------------------------------------------------
+# --deps must not run a venv that git tracks (its bin/python would run).
+MARK=$TMP/mark23
+mkrepo
+mkdir -p "$R/tv/bin"; : >"$R/tv/pyvenv.cfg"
+printf '#!/bin/sh\ntouch "%s"\n' "$MARK" >"$R/tv/bin/python"; chmod +x "$R/tv/bin/python"
+deps execpy "$R/tv"
+[ -e "$MARK" ] || bad "23a0 control: an explicit VENV_DIR is trusted and run" "the marker was not written"
+rm -f "$MARK"
+git -C "$R" add tv; git -C "$R" commit -q --no-verify -m venv
+deps execpy
+expect "23a tracked venv found by the default search: skipped, exit 2" 2 'tv: skipped \(tracked in git; not executed\)' 'audited\)$'
+[ ! -e "$MARK" ] || bad "23b tracked venv not executed" "the marker was written"
+printf '%s' "$OUT" | grep -q 'incomplete (0 audited, 1 skipped)' || bad "23c incomplete line" "$OUT"
+mkrepo; mkdir -p "$R/real/bin"; printf 'home = /x\n' >"$R/real/pyvenv.cfg"; ln -s real/pyvenv.cfg "$R/lnk.cfg"
+mkdir "$R/sl"; ln -s ../real/pyvenv.cfg "$R/sl/pyvenv.cfg"
+deps clean
+expect "23d a symlinked pyvenv.cfg is not a venv" 2 'no venvs found|real: skipped' 'sl:'
+
+# 23e-23g: a venv inside a nested checkout or submodule that is gitignored in
+# the scanned repo. The outer index cannot see what the inner repo tracks.
+# mkinner DIR TRACK: DIR is its own repo with a venv "v"; TRACK=1 commits it.
+mkinner() {
+  mkdir -p "$1/v/bin"; : >"$1/v/pyvenv.cfg"
+  printf '#!/bin/sh\ntouch "%s"\n' "$MARK" >"$1/v/bin/python"; chmod +x "$1/v/bin/python"
+  git init -q "$1" || exit 2
+  git -C "$1" config user.name t; git -C "$1" config user.email t@example.invalid
+  git -C "$1" config commit.gpgsign false
+  if [ "$2" = 1 ]; then git -C "$1" add v; git -C "$1" commit -q -m venv; fi
+  : >"$1/keep"; git -C "$1" add keep; git -C "$1" commit -q -m keep
+}
+MARK=$TMP/mark23e; rm -f "$MARK"
+mkrepo; mkinner "$R/third" 1; printf 'third/\n' >"$R/.gitignore"
+deps execpy
+expect "23e venv committed in a gitignored nested checkout: skipped, exit 2" 2 'third/v: skipped \(tracked in git; not executed\)' 'audited\)$'
+[ ! -e "$MARK" ] || bad "23e2 nested tracked venv not executed" "the marker was written"
+MARK=$TMP/mark23f; rm -f "$MARK"
+SUBSRC=$TMP/subsrc23; mkinner "$SUBSRC" 1
+mkrepo; git -C "$R" -c protocol.file.allow=always submodule add -q "$SUBSRC" sm >/dev/null 2>&1 || bad "23f0 fixture" "submodule add failed"
+git -C "$R" commit -q --no-verify -m sm
+deps execpy
+expect "23f venv committed in a submodule: skipped, exit 2" 2 'sm/v: skipped \(tracked in git[^)]*not executed\)' 'audited\)$'
+[ ! -e "$MARK" ] || bad "23f2 submodule venv not executed" "the marker was written"
+MARK=$TMP/mark23g; rm -f "$MARK"
+mkrepo; mkinner "$R/third" 0; printf 'third/\n' >"$R/.gitignore"
+deps execpy
+expect "23g untracked venv in a nested checkout: audited, exit 0" 0 'third/v: .*findings' 'skipped'
+[ -e "$MARK" ] || bad "23g2 untracked nested venv is audited" "the marker was not written"
+
+# 24 --------------------------------------------------------------------
+mkrepo
+mkdir -p "$TMP/w1/bin" "$TMP/w2/bin"
+for v in "$TMP/w1" "$TMP/w2"; do : >"$v/pyvenv.cfg"; printf '#!/bin/sh\n' >"$v/bin/python"; chmod +x "$v/bin/python"; done
+deps skipdep "$TMP/w1"
+expect "24a package pip-audit could not resolve: listed, exit 0" 0 'w1: 2 packages, 0 findings, 1 not audited \(weirdpkg\)' 'incomplete'
+printf '%s' "$OUT" | grep -q 'scan --deps: clean (1 audited)$' || bad "24a2 clean line" "$OUT"
+deps skipmany "$TMP/w1"
+expect "24b more than ten not audited: first ten, then ..." 0 '12 not audited \(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, \.\.\.\)' 'p11'
+deps failone "$TMP/v1" "$TMP/w2"
+expect "24c one venv fails, one audited: incomplete (1 audited, 1 skipped), exit 2" 2 'scan --deps: incomplete \(1 audited, 1 skipped\)' 'clean'
+deps vuln "$TMP/w1"
+expect "24d findings still exit 1" 1 'findings in 1 of 1 venvs'
 
 # timing (information only) ----------------------------------------------
 mkrepo

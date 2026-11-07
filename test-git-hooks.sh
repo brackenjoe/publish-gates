@@ -15,7 +15,8 @@
 # repo list is set in each temp repo's local config, with
 # git config --add gates.privateRepo. pre-push is run directly with a stub in
 # place of check-visibility.sh (GATES_CHECK_VISIBILITY), so no request is
-# made. The cases that go through git use local bare repositories; the
+# made, and ssh -G host resolution is stubbed the same way (GATES_SSH). The
+# cases that go through git use local bare repositories; the
 # github.com ones reach one through a fake ssh (GIT_SSH_COMMAND).
 #
 # Cases:
@@ -32,13 +33,19 @@
 #                 `commit -n` xref refused naming its short sha and the fix;
 #                 the xref via cherry-pick refused; new branch with an xref
 #                 refused, clean new branch allowed; deletion allowed; an xref
-#                 commit already on the target remote's tracking ref not
-#                 rescanned, one only on a mirror is; xref in the body, a
+#                 commit the target itself lists (ls-remote) not rescanned,
+#                 one only on a mirror, or only on the old target of a
+#                 re-pointed remote name, is; ls-remote failing still
+#                 scans; xref in the body, a
 #                 github.com pull URL: refused; OK=yes does not skip the
 #                 scan; a repo the stub calls public is not scanned; ask, a
 #                 crashing stub and an unlisted repo are scanned;
 #                 gates.privateRepo unset: still scanned, the stub is
 #                 consulted; xref.sh missing: pre-push and commit-msg refuse
+#   host          alias for github.com (GATES_SSH stub) judged as GitHub, an
+#                 alias for another host noted and allowed, a trailing dot,
+#                 gist.github.com refused unless approved, a host starting
+#                 with "-" never passed to ssh, a local path silent
 #   commit-msg    origin example/private-one: owner/repo#12 refused,
 #                 "example/upstream PR 1235" accepted; origin a public fork:
 #                 the same message accepted; no origin: refused;
@@ -312,14 +319,14 @@ sc_push private '' :cleanbr
 sc_expect "scan: branch deletion: allowed" allowed
 if sc_arrived cleanbr; then bad "scan: branch deletion took effect" "still there"; else ok "scan: branch deletion took effect"; fi
 
-# an xref commit already on a remote-tracking ref (pushed with --no-verify)
-# is old history: a clean commit on top is allowed
+# an xref commit already on the target (pushed with --no-verify) is old
+# history: a clean commit on top is allowed
 sc_new $PRIV
 sc_commit o1 "old foo/bar#12"
 sc_push private '' --no-verify main
 sc_commit o2 "clean on top"
 sc_push private '' main
-sc_expect "scan: xref already on a remote-tracking ref, clean on top: allowed" allowed
+sc_expect "scan: xref already on the target, clean on top: allowed" allowed
 
 sc_new $PRIV
 sc_push private '' main
@@ -392,7 +399,7 @@ rc=0
 err=$(STUB_WORD='' STUB_RC=139 GATES_CHECK_VISIBILITY=$STUB git -C "$SC" push gh main 2>&1) || rc=$?
 sc_expect "scan: stub crashing, xref commit: refused by the scan" refused HEAD
 
-# exclusion is the target remote's tracking refs only: a commit pushed to a
+# exclusion is what the target itself lists (ls-remote): a commit pushed to a
 # mirror first is still scanned on the push to the private remote
 sc_new $PRIV
 sc_push private '' main
@@ -403,6 +410,123 @@ sc_commit m1 "mirrored foo/bar#12"
 if git -C "$SC" push -q mirror main 2>/dev/null; then ok "scan: xref commit pushed to a non-github mirror: allowed"; else bad "scan: xref commit pushed to a mirror" "refused"; fi
 sc_push private '' main
 sc_expect "scan: xref commit already on a mirror, now to the private remote: refused" refused HEAD
+
+# host resolution (ssh -G stubbed by GATES_SSH) ------------------------------
+# A Host alias for github.com is judged as GitHub; an alias for anything else
+# passes with a note; a host beginning with "-" never reaches ssh.
+SSHSTUB="$TMP/stub-ssh-g"
+SSH_ARGV="$TMP/stub-ssh-g.argv"
+cat >"$SSHSTUB" <<'SSHSTUBEOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SSH_ARGV"
+printf 'user git\nhostname %s\nport 22\n' "$STUB_HOSTNAME"
+SSHSTUBEOF
+chmod +x "$SSHSTUB"
+export SSH_ARGV
+# ppssh NAME WANT_RC STDERR_PATTERN URL WORD HOSTNAME WANT_LOG: pattern '-' means stderr must be empty
+ppssh() {
+  local name=$1 want=$2 pat=$3 url=$4 word=$5 hn=$6 wantlog=$7 rc err
+  : >"$LOG"; : >"$SSH_ARGV"
+  err=$(STUB_WORD=$word STUB_RC=0 STUB_HOSTNAME=$hn GATES_SSH=$SSHSTUB GATES_CHECK_VISIBILITY=$STUB \
+    "$HOOKS/pre-push" origin "$url" </dev/null 2>&1 >/dev/null); rc=$?
+  if [ "$rc" -ne "$want" ]; then bad "$name" "rc=$rc, want $want; stderr: $err"; return; fi
+  if [ "$pat" = - ]; then
+    [ -z "$err" ] || { bad "$name" "stderr not empty: $err"; return; }
+  elif [ -n "$pat" ] && ! printf '%s' "$err" | grep -Eq -- "$pat"; then bad "$name" "stderr lacks /$pat/: $err"; return; fi
+  if [ "$(cat "$LOG")" != "$wantlog" ]; then bad "$name" "stub called with '$(cat "$LOG")', want '$wantlog'"; return; fi
+  ok "$name"
+}
+ppssh "alias for github.com, public: refused, checker called" 1 'o/r is public' git@gh-work:o/r.git public github.com 'o r'
+ppssh "alias for github.com, private: allowed, checker called" 0 '' git@gh-work:o/r.git private GitHub.com. 'o r'
+ppssh "ssh:// alias for github.com, public: refused"          1 'o/r is public' ssh://git@gh-work/o/r.git public github.com 'o r'
+ppssh "alias for another host: allowed with a note"           0 'not checked: host gh-work is not GitHub' git@gh-work:o/r.git public example.net ''
+ppssh "ssh -G prints no hostname: allowed with a note"        0 'not checked: host gh-work is not GitHub' git@gh-work:o/r.git public '' ''
+ppssh "https URL on another host: note, ssh not run"          0 'not checked: host example.com is not GitHub' https://example.com/o/r.git public github.com ''
+if [ ! -s "$SSH_ARGV" ]; then ok "https host is never resolved through ssh"; else bad "https host is never resolved" "ssh argv: $(cat "$SSH_ARGV")"; fi
+ppssh "github.com via ssh: no resolution needed"              0 '' git@github.com:o/r.git private example.net 'o r'
+if [ ! -s "$SSH_ARGV" ]; then ok "a GitHub name is not passed to ssh -G"; else bad "a GitHub name is not passed to ssh" "$(cat "$SSH_ARGV")"; fi
+ppssh "https://github.com./ trailing dot: reaches the checker" 1 'o/r is public' https://github.com./o/r.git public example.net 'o r'
+ppssh "git@github.com.:o/r trailing dot: reaches the checker" 0 '' git@github.com.:o/r.git private example.net 'o r'
+ppssh "gist https, no approval: refused, says gist"           1 'gist' https://gist.github.com/abc.git private github.com ''
+ppssh "git@gist.github.com, no approval: refused"             1 'gist' git@gist.github.com:abc.git private github.com ''
+rc=0
+err=$(STUB_WORD=private STUB_RC=0 GATES_CHECK_VISIBILITY=$STUB GATES_PUBLIC_PUSH_OK=yes "$HOOKS/pre-push" origin https://gist.github.com/abc.git </dev/null 2>&1 >/dev/null) || rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'gist.*approved by GATES_PUBLIC_PUSH_OK'; then ok "gist with GATES_PUBLIC_PUSH_OK=yes: allowed"; else bad "gist with OK=yes" "rc=$rc: $err"; fi
+ppssh "host starting with - (scp-like): not resolved, note"    0 'not checked' 'git@-oProxyCommand=x:o/r.git' public github.com ''
+if [ ! -s "$SSH_ARGV" ]; then ok "host starting with - is never passed to ssh (scp-like)"; else bad "dash host passed to ssh (scp-like)" "$(cat "$SSH_ARGV")"; fi
+ppssh "host starting with - (ssh://): not resolved, note"      0 'not checked' 'ssh://-oProxyCommand=x/o/r.git' public github.com ''
+if [ ! -s "$SSH_ARGV" ]; then ok "host starting with - is never passed to ssh (ssh://)"; else bad "dash host passed to ssh (ssh://)" "$(cat "$SSH_ARGV")"; fi
+ppssh "a resolved host is passed after --"                    0 '' git@gh-work:o/r.git private github.com 'o r'
+if [ "$(cat "$SSH_ARGV")" = "-G -- gh-work" ]; then ok "ssh is run as: ssh -G -- HOST"; else bad "ssh argv" "$(cat "$SSH_ARGV")"; fi
+ppssh "local path: no note"                                    0 - /srv/x/repo.git public github.com ''
+ppssh "relative local path: no note"                           0 - ./repo.git public github.com ''
+rm -f "$SSH_ARGV"
+
+# through git: an alias for github.com whose checker answers public is refused
+# and nothing arrives; the alias for another host goes through with a note
+sc_new git@gh-work:o/r.git
+sc_commit al1 "alias commit"
+: >"$LOG"
+rc=0
+err=$(STUB_WORD=public STUB_RC=0 STUB_HOSTNAME=github.com GATES_SSH=$SSHSTUB GATES_CHECK_VISIBILITY=$STUB git -C "$SC" push gh main 2>&1) || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$err" | grep -q 'pre-push: refused: o/r is public' && ! sc_arrived main && [ "$(cat "$LOG")" = "o r" ]; then
+  ok "git push through an alias for github.com, public: refused, nothing arrives, checker called"
+else bad "git push through an alias for github.com" "rc=$rc: $err"; fi
+rc=0
+err=$(STUB_WORD=public STUB_RC=0 STUB_HOSTNAME=example.net GATES_SSH=$SSHSTUB GATES_CHECK_VISIBILITY=$STUB git -C "$SC" push gh main 2>&1) || rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'not checked: host gh-work' && sc_arrived main; then
+  ok "git push through an alias for another host: arrives, with the note"
+else bad "git push through an alias for another host" "rc=$rc: $err"; fi
+
+# the remote name is re-pointed after an xref commit went to the old target
+# with --no-verify: the old tracking refs must not exempt it
+OLDBARE=$(mktemp -d "$TMP/old.XXXXXX")
+git init -q --bare "$OLDBARE" || { echo "fixture failed" >&2; exit 2; }
+sc_new "$OLDBARE"
+sc_commit rp1 "old foo/bar#12"
+git -C "$SC" push -q --no-verify gh main 2>/dev/null || { echo "fixture push failed" >&2; exit 2; }
+git -C "$SC" remote set-url gh "$PRIV"
+sc_push private '' main
+sc_expect "scan: remote re-pointed, xref commit only on the old target: refused" refused HEAD
+if sc_arrived main; then bad "scan: re-pointed push delivered nothing" "main arrived"; else ok "scan: re-pointed push delivered nothing"; fi
+
+# a commit already on the target is not rescanned when a new branch is pushed
+sc_new $PRIV
+sc_commit pre1 "old foo/bar#12"
+sc_push private '' --no-verify main
+git -C "$SC" checkout -q -b newer
+sc_commit pre2 "clean new branch work"
+sc_push private '' newer
+sc_expect "scan: new branch on top of an xref commit already on the target: allowed" allowed
+sc_commit pre3 "new foo/bar#13"
+sc_push private '' newer
+sc_expect "scan: a new xref commit on that branch is still refused" refused HEAD
+if printf '%s' "$err" | grep -q "old foo"; then bad "scan: only the new commit is named" "$err"; else ok "scan: only the new commit is named"; fi
+
+# ls-remote failing (upload-pack not served): xref still refused, clean allowed
+cat >"$TMP/fake-ssh-noup" <<'SSHEOF'
+#!/bin/sh
+for a; do last=$a; done
+case $last in
+git-receive-pack*) exec git receive-pack "$FAKE_REMOTE" ;;
+esac
+exit 1
+SSHEOF
+chmod +x "$TMP/fake-ssh-noup"
+SAVED_SSH=$GIT_SSH_COMMAND
+export GIT_SSH_COMMAND="$TMP/fake-ssh-noup"
+sc_new $PRIV
+sc_push private '' main
+sc_commit nu1 "fix per foo/bar#12"
+sc_push private '' main
+sc_expect "scan: ls-remote fails, xref commit: refused" refused HEAD
+sc_new $PRIV
+sc_push private '' main
+sc_commit nu2 "nothing special"
+sc_push private '' main
+sc_expect "scan: ls-remote fails, clean commit: allowed" allowed
+if sc_arrived main && [ "$(git -C "$FAKE_REMOTE" rev-parse main)" = "$(git -C "$SC" rev-parse HEAD)" ]; then ok "scan: ls-remote fails, clean push arrived"; else bad "scan: ls-remote fails, clean push arrived" "tip missing"; fi
+export GIT_SSH_COMMAND=$SAVED_SSH
 
 # xref.sh missing: both hooks refuse
 NOLIB="$TMP/hooks-nolib"

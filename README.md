@@ -30,14 +30,15 @@ clone; add `.venv-scan/` and `gitleaks/` to the clone's `.git/info/exclude`
 so they stay out of `git status` (the repo ships no `.gitignore`, so that
 your own copy decides).
 
-**Requirements:** bash 4 or later (`scan.sh` uses associative arrays; macOS
-ships 3.2), Python 3.7 or later for `check-media-metadata.py`, GNU grep with PCRE (`grep -P`; `public-scan.sh` checks at start
+**Requirements:** bash 4.4 or later (`scan.sh` and `public-scan.sh` use
+associative arrays and `mapfile -d`; macOS ships 3.2, and `public-scan.sh`
+exits 2 naming the version), Python 3.7 or later for `check-media-metadata.py`, GNU grep with PCRE (`grep -P`; `public-scan.sh` checks at start
 and exits 2 without it), git 2.31 or later (`rev-parse --path-format`),
-coreutils `timeout` for `scan.sh --deps`, curl for `check-visibility.sh`,
+coreutils `timeout` for `scan.sh --deps` and to bound `pre-push`'s network calls, curl for `check-visibility.sh`,
 ffprobe (ffmpeg) for `check-media-metadata.py` when a video is present
 (and ffmpeg with libx264, libwebp and libvpx-vp9 for its test),
 perl for `public-scan.sh`'s allow list, and gitleaks 8.30.1 or later
-(`scan.sh` uses its `git` and `dir` subcommands and `--gitleaks-ignore-path`,
+(`scan.sh` uses its `dir` subcommand and `--gitleaks-ignore-path`,
 verified on 8.30.1 only).
 
 **Scanner tools** for `scan.sh` (the hooks `commit-msg` and `pre-push`,
@@ -89,11 +90,12 @@ commit rather than passing it.
     scan.sh --deps [VENV_DIR...]  pip-audit the venvs (needs network)
 
 Exit 0 clean, 1 findings, 2 usage or setup error (a tool or config missing,
-or under `--deps` every venv skipped).
+or under `--deps` any venv skipped).
 
 `--staged` and `--all` are offline and scan the **index**, not the working
-tree: the selected paths are exported with `git checkout-index` into a temp
-directory, so a partly staged file is judged as it will be committed, and
+tree: for the linters the selected paths are exported with `git checkout-index`
+into a temp directory, and gitleaks reads the raw blobs (below), so a partly
+staged file is judged as it will be committed, and
 nothing is written into the repo. Python files are `*.py` or an
 extensionless file whose shebang names python; shell files are `*.sh` or an
 extensionless file whose shebang ends in sh, bash or dash.
@@ -103,7 +105,7 @@ extensionless file whose shebang ends in sh, bash or dash.
 | ruff | `--isolated`, only E9, F63, F7, F82: syntax errors and undefined names |
 | bandit | medium and higher severity and confidence |
 | shellcheck | `--norc`, warning and higher |
-| gitleaks | every selected file, not only Python and shell; `--redact`, so a found secret is never printed. Under `--staged` it reads git itself, so `scan.exclude` does not apply to it and a commit made only of excluded files still gets the secret scan |
+| gitleaks | every selected file, not only Python and shell, read as the raw blob in the index, so no `.gitattributes` (`-diff`, `binary`, an encoding) can hide one; whole files, so a secret already in a file you modify is reported too; `--redact`, so a found secret is never printed. Under `--staged`, `scan.exclude` does not apply to it, so a commit made only of excluded files, or only of type changes, still gets the secret scan |
 
 Every linter ignores config files in the scanned tree (`pyproject.toml`,
 `ruff.toml`, `.shellcheckrc`, `.bandit`, `.gitleaks.toml`, `.gitleaksignore`).
@@ -127,8 +129,12 @@ format comment.
 `--deps` runs pip-audit over each venv's installed packages: by default
 every directory holding `pyvenv.cfg` under the top of the repository you
 run it in (outside any repository, name the venvs), else the ones named. pip, setuptools and wheel findings are reported as "venv tooling" and
-do not fail the run. A venv whose audit fails (no network, a pip-audit
-error) is skipped, not a finding; if every venv is skipped the exit is 2.
+do not fail the run. A venv found by the default search that git tracks is
+never run (its `bin/python` would be the repository's code). A venv whose
+audit fails (no network, a pip-audit error) or that is tracked is skipped,
+and any skip makes the run exit 2 with `incomplete (M audited, S skipped)`;
+findings still exit 1. Packages pip-audit cannot look up (local or editable
+ones) are named as not audited and do not change the exit.
 
 ## git-hooks/pre-commit
 
@@ -161,11 +167,13 @@ cherry-pick, rebase picks, `commit-tree` or `am`, so the gate is
 
 1. It runs `check-visibility.sh OWNER REPO` once. Unless the answer is
    `public`, it scans the full message of every commit being pushed that is
-   not already on the target remote (reachable from that remote's tracking
-   refs or its current tip), and refuses the push on a cross-reference,
-   naming the commit and line. A deleted ref is skipped; a git failure
-   refuses. A push to a mirror or a second remote first does not exempt the
-   commits.
+   not already on the target: listed by `git ls-remote` of the push URL,
+   or the pushed ref's current tip there. It refuses the push on a
+   cross-reference, naming the commit and line. A deleted ref is skipped; a
+   `rev-list` or `log` failure refuses; if `ls-remote` fails only the tip is
+   exempt, so more is scanned, not less. It runs with `GIT_TERMINAL_PROMPT=0`,
+   so it never asks for credentials a second time. A commit that is only on a mirror, or on the old
+   repository behind a remote whose URL changed, is not exempt.
 2. `private` passes. `public`, `ask`, a checker failure or a URL it cannot
    read an owner and repo from is refused, because an unknown is not
    private, unless the owner's approval is in the environment of the push
@@ -173,9 +181,22 @@ cherry-pick, rebase picks, `commit-tree` or `am`, so the gate is
    exported, or every push in that shell is approved, each saying so on
    stderr). The approval does not skip step 1.
 
-A remote that is not github.com (a local path, another host) passes both.
-The visibility check is one unauthenticated API call, up to 20 s; with no
-network it answers `ask` and the push is refused. Both hooks source
+The host counts as GitHub when it is `github.com`, `www.github.com`,
+`ssh.github.com` or `gist.github.com`, after a trailing dot is stripped.
+For the scp-like and `ssh://` forms (`git+ssh://` and `ssh+git://` too), a
+host that is not already one of those names is resolved as an ssh `Host`
+alias, to its `HostName` from `ssh -G` (which reads ssh config and connects
+to nothing); `GATES_SSH=PATH` replaces ssh (the test stubs it). Only the
+default ssh config is read: if git is pointed at another one
+(`core.sshCommand`, `GIT_SSH_COMMAND` or `GIT_SSH` with `-F FILE`, or another
+program), an alias defined only there is not resolved and passes as not
+checked. A gist push is
+refused unless approved, since the checker judges repos, not gists. Any
+other host passes both checks with one `pre-push: not checked: host H is
+not GitHub` line on stderr; a local path passes silently. The visibility
+check is one unauthenticated API call, up to 20 s, and the scan adds one
+`git ls-remote`; with no network the check answers `ask` and the push is
+refused. Both hooks source
 `git-hooks/xref.sh`, which holds the pattern and the config lookup; a
 missing `xref.sh` refuses. `pre-push` finds `check-visibility.sh` at
 `../check-visibility.sh`; `GATES_CHECK_VISIBILITY=PATH` replaces it (the test
@@ -189,11 +210,23 @@ outer permission layer, those two forms are what it should prompt on.
 
 Scans every file under DIR: in a git checkout the tracked and
 untracked-not-ignored files, so a file copied in before `git add` is
-covered; elsewhere every file, `.git` excluded. Pass or fail only: exit 0
-clean (the ok line says how many files it read), 1 on any hit (each printed
-with file and line), 2 on bad usage, on a grep without PCRE, or when the
-selection is empty (an empty or gitignored directory), so a scan of nothing
-never passes. It does not replace reading the diff; it catches what reading
+covered; elsewhere every file, `.git` excluded. Exit 0 clean, 1 on any hit
+(each printed with file and line), 2 when it could not check: bad usage, a
+grep without PCRE, an empty selection (an empty or gitignored directory),
+a listed path that cannot be read as a file (a tracked file deleted from
+the worktree, an unreadable file or directory, a fifo or other special
+file, a directory listed in place of a file, an untracked nested
+repository; each named), a name containing a newline, or any error from
+the listing or from grep. So a scan of nothing, or of less than it says,
+never passes. A symbolic link is not followed: its target string is
+scanned as text (a hit prints as `PATH (symlink target)`) and it is named
+and counted as a link not followed. A submodule is named and counted as
+not scanned; scan it separately. A file containing a NUL byte is
+binary: it is named on stderr as `skipped (binary)` and not scanned, and
+the ok line counts them, `(T files, B binary skipped)`, plus links and
+submodules when there are any; images and video go
+through `check-media-metadata.py`. Matching is bytewise (`LC_ALL=C`), so no
+line is dropped for its encoding. It does not replace reading the diff; it catches what reading
 misses.
 
 Patterns: IPv4 addresses (`127.0.0.1` and `0.0.0.0` exactly pass), global and ULA IPv6
@@ -211,16 +244,26 @@ passes, and a URL password that starts with `$`, `<`, `{`, `\` or `*` or is
 home-directory paths pass on purpose.
 
 Your own terms: `public-scan.deny` beside the script, one term per line,
-`#` comments, matched case-insensitively as a whole word; a missing file is
-skipped, and so is a `PUBLIC_SCAN_DENY=FILE` that does not exist, so check
-the path if a term you expect to hit does not. `PUBLIC_SCAN_DENY=FILE` names another file; `PUBLIC_SCAN_TERMS`
+`#` comments, matched as a whole word and case-insensitively (ASCII only);
+leading and trailing white space and a CR are trimmed, and the ok line
+says how many terms it applied. A missing default file is skipped;
+`PUBLIC_SCAN_DENY=FILE` names another file, which must be a readable
+regular file or the exit is 2. `PUBLIC_SCAN_TERMS`
 adds terms, comma or newline separated, for an environment where no file
 can be kept. The terms are never printed except as matched lines.
 
 `PUBLIC_SCAN_ALLOW=FILE` lists exact strings you publish on purpose, one per
 line. On a hit, every allow string is removed from the line and the rule is
 tested on what is left, so an allowed address passes and a second, different
-address on the same line still fails. Needs perl.
+address on the same line still fails. A string is removed only as a whole
+token: allowing an address does not hide a longer one it is part of (a
+letter in front, `.au` after, one more digit on an IP address), while a full
+stop ending a sentence is not part of the token. A string that starts or
+ends with something other than a letter or digit (a dash, say) brings its
+own boundary on that side. An allow string that holds a colon (an IPv6 or
+MAC address) is bounded by colons too, so it does not hide a longer address;
+one without a colon, such as `git@github.com`, still passes before
+`:owner/repo`. Needs perl.
 
 ## check-media-metadata.py
 
@@ -274,12 +317,13 @@ Through some proxies a private repo can answer 200 and a public one 403; a
 
     ./test-scan.sh             # scan.sh and pre-commit, in temp repos with the real linters
     ./test-git-hooks.sh        # commit-msg and pre-push, with a stub in place of the network
+    ./test-public-scan.sh      # public-scan.sh, in temp directories
     ./check-visibility.sh --selftest
     ./test-check-media-metadata.sh   # the media gate, 53 fixture cases (needs ffmpeg)
 
 All offline, bash. `test-scan.sh` needs the scanner tools above;
 `test-check-media-metadata.sh` needs python3 and ffmpeg with ffprobe,
-libx264, libwebp and libvpx-vp9; the others need only git.
+libx264, libwebp and libvpx-vp9; `test-public-scan.sh` needs git, perl and GNU grep with PCRE; the others need only git.
 
 The tests' fixtures hold email-shaped strings on purpose (`t@example.invalid`
 as the temp repos' author, the `git@` URL form), so `public-scan.sh .` run on

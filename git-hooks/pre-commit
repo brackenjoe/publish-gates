@@ -48,7 +48,7 @@ if [ ! -f "$scan" ]; then
     exit 0
 fi
 
-git diff --cached --name-only --diff-filter=ACMR | grep -Eq '(^|/)[^/]*requirements[^/]*\.txt$' &&
+git diff --cached --name-only --diff-filter=ACMRT | grep -Eq '(^|/)[^/]*requirements[^/]*\.txt$' &&
     echo "pre-commit: requirements changed: run scan.sh --deps after installing" >&2
 
 "$scan" --staged

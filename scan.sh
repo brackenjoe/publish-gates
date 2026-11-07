@@ -11,31 +11,42 @@
 #   scan.sh --deps [VENV_DIR...]        pip-audit the venvs (needs network)
 #
 # Exit 0 clean, 1 findings, 2 usage or setup error (a tool or config missing,
-# or under --deps every venv skipped).
+# or under --deps any venv skipped).
 #
 # --staged and --all are offline. They scan the INDEX content, not the working
-# tree: the selected paths are exported with git checkout-index into a temp
-# dir, so a partly staged file is judged as it will be committed, and nothing
-# is written into the repo. Paths in scan.exclude (beside this script)
+# tree, so a partly staged file is judged as it will be committed, and nothing
+# is written into the repo. --staged covers added, copied, modified, renamed and
+# type-changed paths (not deletions); a commit that only deletes files is clean
+# (0 files). For the linters the selected paths are exported with git
+# checkout-index into a temp dir. Paths in scan.exclude (beside this script)
 # are dropped first.
 #   Python: *.py, or no extension and a shebang naming python.
 #   Shell:  *.sh, or no extension and a shebang ending in sh, bash or dash.
 #   ruff        --isolated, only E9,F63,F7,F82 (syntax errors, undefined names)
 #   bandit      medium and higher severity and confidence
 #   Shell lint  shellcheck --norc, warning and higher
-#   gitleaks    every selected file, not only py and sh; always the config
-#               beside the binary and --redact (a .gitleaks.toml in the scanned tree
-#               would otherwise replace the rules). Under --staged it reads
-#               git itself, so scan.exclude does not apply to it, and it runs
-#               even when every staged path is excluded. A .gitleaksignore in
-#               the scanned tree is not honoured: gitleaks reads one from its
-#               working directory (-i, default ".") and, under git, from the
-#               source directory. -i points at a file that does not exist and
-#               --staged names an empty directory as the source, with GIT_DIR
-#               set to the repo, so the staged content is still what is read.
-#               Under --all the source is the exported tree by absolute path,
-#               and fingerprints carry that path, which no tracked file can
-#               match.
+#   gitleaks    every staged (--staged) or selected (--all) file, not only py
+#               and sh; always the config beside the binary and --redact (a
+#               .gitleaks.toml in the scanned tree would otherwise replace the
+#               rules). It runs "gitleaks dir" over a separate tree, $TMP/gl,
+#               holding the RAW blob of each path, read with git cat-file from
+#               the index. No .gitattributes filter, working-tree-encoding or
+#               -diff attribute applies, so none can hide content from it.
+#               Symlinks and gitlinks are not copied. Whole files are scanned,
+#               not only the added lines, so a secret already sitting in a
+#               modified file is reported; that is intended. Under --staged
+#               every staged path is read, so scan.exclude does not apply to
+#               it and it runs even when every staged path is excluded; under
+#               --all scan.exclude is honoured. Findings are reported under
+#               the repo path. Checked against gitleaks 8.30.1: dir mode reads
+#               a .gitleaksignore only from the source root (and from its
+#               working directory, -i); a .gitleaksignore in a subdirectory
+#               and a .gitleaks.toml anywhere in the source are not read. A
+#               tracked root .gitleaksignore is therefore written into the
+#               tree as .gitleaksignore.content (still scanned, reported under
+#               its real name), so the source root never holds a file gitleaks
+#               honours. -i points at a file that does not exist. Fingerprints
+#               carry the temp path, which no tracked file can match.
 # Every linter ignores config files in the scanned tree (pyproject.toml,
 # ruff.toml, .shellcheckrc, .bandit). The only suppressions are the tools' own
 # comments: # noqa: CODE, # nosec BNNN, # shellcheck disable=SCNNNN, and
@@ -57,8 +68,14 @@
 # in this script's directory (except its own .venv-scan; checked-out trees live
 # beside the scanner), else ours. pip, setuptools and wheel findings are
 # "venv tooling": printed, but do not make the exit 1. A venv whose audit
-# fails (no network, pip-audit error) is skipped, not a finding; if every venv
-# is skipped the exit is 2.
+# fails (no network, pip-audit error, unparsable output), has no bin/python, or
+# is tracked in git is skipped, not a finding. A venv with tracked files is
+# never executed (its bin/python would run), unless named as a VENV_DIR argument,
+# which is trusted. A pyvenv.cfg that is not a regular file is not a venv.
+# A package pip-audit could not resolve (skip_reason) is reported per venv as
+# "K not audited (names)" and does not change the exit. Exit 1 on findings;
+# else exit 2 if any venv was skipped ("incomplete (M audited, S skipped)");
+# else 0 ("clean (M audited)"). So 0 means every venv was audited.
 #
 # Tools (resolved, never installed). DIR is this script's directory inside the
 # main checkout (MAIN/REL, where REL is the script's path from its worktree top;
@@ -116,14 +133,15 @@ if [ "$mode" = deps ]; then
   [ -x "$PIP_AUDIT" ] || die "setup: pip-audit not found at $PIP_AUDIT; rebuild the scanner venv: $REBUILD"
   command -v python3 >/dev/null || die "setup: python3 not found on PATH"
   venvs=()
+  explicit=0
   SEARCH=$(git rev-parse --show-toplevel 2>/dev/null) || SEARCH=''
   if [ $# -gt 0 ]; then
-    venvs=("$@")
+    venvs=("$@"); explicit=1
   else
     [ -n "$SEARCH" ] || die "--deps: not inside a git repository; pass VENV_DIR arguments"
     while IFS= read -r -d '' cfg; do
       venvs+=("$(dirname "$cfg")")
-    done < <(find "$SEARCH" \( -name node_modules -o -name .git \) -prune -o -name pyvenv.cfg -print0 2>/dev/null | sort -z)
+    done < <(find "$SEARCH" \( -name node_modules -o -name .git \) -prune -o -type f -name pyvenv.cfg -print0 2>/dev/null | sort -z)
   fi
   [ ${#venvs[@]} -gt 0 ] || die "no venvs found under $SEARCH"
 
@@ -136,9 +154,11 @@ try:
 except Exception:
     sys.exit(3)
 TOOLING = {"pip", "setuptools", "wheel"}
-real, tool, seen_r, seen_t = [], [], set(), set()
+real, tool, seen_r, seen_t, noaud = [], [], set(), set(), []
 for d in deps:
     name = str(d.get("name", "?"))
+    if d.get("skip_reason"):
+        noaud.append(name)
     for v in d.get("vulns") or []:
         vid = str(v.get("id", "?"))
         fix = ", ".join(v.get("fix_versions") or []) or "none"
@@ -149,6 +169,8 @@ for d in deps:
         elif vid not in seen_r:
             seen_r.add(vid); real.append(item)
 line = "[%s] %s: %d packages, %d findings" % (label, path, len(deps), len(real))
+if noaud:
+    line += ", %d not audited (%s%s)" % (len(noaud), ", ".join(noaud[:10]), ", ..." if len(noaud) > 10 else "")
 if tool:
     line += " (+%d tooling: %s)" % (len(tool), "; ".join(tool))
 print(line)
@@ -156,6 +178,29 @@ for item in real:
     print("    " + item)
 sys.exit(10 if real else 0)
 '
+  # venv_tracked ABS: 0 untracked, 1 tracked, 2 git could not tell (the caller
+  # treats it as tracked). Asks the outer repo, then the repository that holds
+  # the venv itself (a nested checkout or submodule the outer index cannot
+  # see). Any nonzero exit or stderr from git is "could not tell".
+  venv_tracked() {
+    local abs=$1 gerr top out rc
+    gerr=$(mktemp) || return 2
+    gq() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR LC_ALL=C git "$@" 2>"$gerr"; }
+    out=$(gq -C "$SEARCH" ls-files -- ":(literal)$abs"); rc=$?
+    if [ $rc -ne 0 ] || [ -s "$gerr" ]; then rm -f "$gerr"; return 2; fi
+    if [ -n "$out" ]; then rm -f "$gerr"; return 1; fi
+    top=$(gq -C "$abs" rev-parse --show-toplevel); rc=$?
+    if [ $rc -ne 0 ]; then
+      if grep -q '^fatal: not a git repository' "$gerr"; then rm -f "$gerr"; return 0; fi
+      rm -f "$gerr"; return 2
+    fi
+    if [ -s "$gerr" ] || [ -z "$top" ]; then rm -f "$gerr"; return 2; fi
+    out=$(gq -C "$abs" ls-files -- .); rc=$?
+    if [ $rc -ne 0 ] || [ -s "$gerr" ]; then rm -f "$gerr"; return 2; fi
+    rm -f "$gerr"
+    [ -n "$out" ] && return 1
+    return 0
+  }
   nfind=0; nskip=0; naud=0
   for v in "${venvs[@]}"; do
     v=${v%/}
@@ -171,6 +216,14 @@ sys.exit(10 if real else 0)
     "$DIR/.venv-scan") ;;
     "$DIR"/*) label=third-party ;;
     esac
+    if [ "$explicit" -eq 0 ]; then
+      venv_tracked "$abs"
+      case $? in
+      0) ;;
+      1) echo "$rel: skipped (tracked in git; not executed)"; nskip=$((nskip + 1)); continue ;;
+      *) echo "$rel: skipped (tracked in git, or git could not tell; not executed)"; nskip=$((nskip + 1)); continue ;;
+      esac
+    fi
     if [ ! -x "$abs/bin/python" ]; then
       echo "$rel: skipped (no bin/python)"; nskip=$((nskip + 1)); continue
     fi
@@ -194,11 +247,11 @@ sys.exit(10 if real else 0)
     echo "scan --deps: findings in $nfind of ${#venvs[@]} venvs ($nskip skipped)"
     exit 1
   fi
-  if [ $naud -eq 0 ]; then
-    echo "scan --deps: every venv was skipped; nothing audited" >&2
+  if [ $nskip -gt 0 ]; then
+    echo "scan --deps: incomplete ($naud audited, $nskip skipped)"
     exit 2
   fi
-  echo "scan --deps: clean ($naud audited, $nskip skipped)"
+  echo "scan --deps: clean ($naud audited)"
   exit 0
 fi
 
@@ -248,7 +301,7 @@ fi
 
 all=()
 if [ "$mode" = staged ]; then
-  while IFS= read -r -d '' p; do all+=("$p"); done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+  while IFS= read -r -d '' p; do all+=("$p"); done < <(git diff --cached --name-only --diff-filter=ACMRT -z)
 else
   while IFS= read -r -d '' p; do all+=("$p"); done < <(git ls-files -z)
 fi
@@ -263,10 +316,15 @@ for p in "${all[@]}"; do
   [ $skip -eq 1 ] || files+=("$p")
 done
 
-# Under --staged gitleaks reads git itself and ignores scan.exclude, so it runs
-# whenever anything is staged, even if every staged path is excluded. Under
-# --all it scans the exported tree, which honours the exclude list.
-if [ ${#all[@]} -eq 0 ] || { [ "$mode" = all ] && [ ${#files[@]} -eq 0 ]; }; then
+# Under --staged gitleaks reads every staged path and ignores scan.exclude, so
+# the early exit is only for a commit that holds nothing but deletions. Under
+# --all gitleaks reads files[], which honours the exclude list.
+if [ "$mode" = staged ]; then
+  if git diff --cached --quiet --diff-filter=d; then
+    echo "scan: clean (0 files)"
+    exit 0
+  fi
+elif [ ${#files[@]} -eq 0 ]; then
   echo "scan: clean (0 files)"
   exit 0
 fi
@@ -278,6 +336,70 @@ mkdir "$W" || die "mkdir failed"
 if [ ${#files[@]} -gt 0 ]; then
   printf '%s\0' "${files[@]}" | git checkout-index --prefix="$W/" -z --stdin || die "could not export the index"
 fi
+
+# Fills the gitleaks tree: stdin is the NUL-separated path list, argv the
+# target directory and a file that records the alias used for a root
+# .gitleaksignore. Blobs come from the index (stage 0) through git cat-file,
+# so no attribute, filter or encoding touches them; symlinks and gitlinks
+# are left out.
+gl_fill='
+import os, subprocess, sys, tempfile
+dst, aliasf = sys.argv[1], sys.argv[2]
+paths = [p for p in sys.stdin.buffer.read().split(b"\0") if p]
+want = set(paths)
+alias = b".gitleaksignore.content"
+while alias in want:
+    alias += b"_"
+open(aliasf, "wb").write(alias)
+ls = subprocess.run(["git", "ls-files", "-s", "-z"], stdout=subprocess.PIPE, check=True).stdout
+index = {}
+for ent in ls.split(b"\0"):
+    if not ent:
+        continue
+    meta, _, path = ent.partition(b"\t")
+    mode, sha, stage = meta.split()
+    if stage == b"0":
+        index[path] = (mode, sha)
+todo = []
+for p in paths:
+    ent = index.get(p)
+    if ent and ent[0] in (b"100644", b"100755"):
+        todo.append((p, ent[1]))
+if not todo:
+    sys.exit(0)
+with tempfile.TemporaryFile() as req, tempfile.TemporaryFile() as resp:
+    for _, sha in todo:
+        req.write(sha + b"\n")
+    req.seek(0)
+    subprocess.run(["git", "cat-file", "--batch"], stdin=req, stdout=resp, check=True)
+    resp.seek(0)
+    for p, sha in todo:
+        head = resp.readline().split()
+        if len(head) != 3 or head[1] != b"blob":
+            sys.exit(1)
+        size = int(head[2])
+        data = resp.read(size)
+        resp.read(1)
+        name = alias if p == b".gitleaksignore" else p
+        out = os.path.join(os.fsencode(dst), name)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "wb") as fh:
+            fh.write(data)
+'
+# Turns the gitleaks JSON into "path:line: rule" lines: strips the tree prefix
+# as a plain string (no pattern) and maps the alias back to .gitleaksignore.
+gl_parse='
+import json, sys
+root = sys.argv[1].rstrip("/") + "/"
+alias = open(sys.argv[2], "rb").read().decode("utf-8", "surrogateescape")
+for r in json.load(sys.stdin) or []:
+    f = r["File"]
+    if f.startswith(root):
+        f = f[len(root):]
+    if f == alias:
+        f = ".gitleaksignore"
+    print("%s:%s: %s" % (f, r["StartLine"], r["RuleID"]))
+'
 
 py=(); sh=()
 re_py='^#!.*python'
@@ -312,15 +434,15 @@ fi
 if [ ${#sh[@]} -gt 0 ]; then
   run shellcheck shellcheck --norc -S warning -f gcc -- "${sh[@]}"
 fi
-if [ "$mode" = staged ]; then
-  GLSRC=$TMP/gl-src
-  mkdir "$GLSRC" || die "mkdir failed"
-  GLGIT=$(git rev-parse --absolute-git-dir) || die "cannot find the git dir"
-  GLIDX=$(git rev-parse --path-format=absolute --git-path index) || die "cannot find the index"
-  run gitleaks env GIT_DIR="$GLGIT" GIT_WORK_TREE="$GLSRC" GIT_INDEX_FILE="$GLIDX" "$GITLEAKS" git --pre-commit --staged --redact --no-banner --no-color --config "$GL_CONFIG" --gitleaks-ignore-path "$TMP/no-gitleaksignore" -f json -r - "$GLSRC"
-else
-  run gitleaks "$GITLEAKS" dir "$W" --redact --no-banner --no-color --config "$GL_CONFIG" --gitleaks-ignore-path "$TMP/no-gitleaksignore" -f json -r -
+# gitleaks reads a separate tree of raw blobs (see the header).
+GLDIR=$TMP/gl
+mkdir "$GLDIR" || die "mkdir failed"
+printf "%s" .gitleaksignore.content >"$TMP/gl.alias"
+if [ "$mode" = staged ]; then glpaths=("${all[@]}"); else glpaths=("${files[@]}"); fi
+if [ ${#glpaths[@]} -gt 0 ]; then
+  printf '%s\0' "${glpaths[@]}" | python3 -I -c "$gl_fill" "$GLDIR" "$TMP/gl.alias" || die "could not read the index blobs for gitleaks"
 fi
+run gitleaks "$GITLEAKS" dir "$GLDIR" --redact --no-banner --no-color --config "$GL_CONFIG" --gitleaks-ignore-path "$TMP/no-gitleaksignore" -f json -r -
 wait
 
 total=0; toolerr=0; known=0
@@ -336,10 +458,7 @@ for n in ruff bandit shellcheck gitleaks; do
   ruff | shellcheck) lines=$(grep -E '^.+:[0-9]+:[0-9]+: ' "$TMP/$n.out") ;;
   bandit) lines=$(grep -E '^.+:[0-9]+: B[0-9]+ ' "$TMP/$n.out") ;;
   gitleaks)
-    lines=$(python3 -I -c '
-import json, sys
-for r in json.load(sys.stdin) or []:
-    print("%s:%s: %s" % (r["File"], r["StartLine"], r["RuleID"]))' <"$TMP/$n.out" 2>/dev/null | sed "s#$W/##")
+    lines=$(python3 -I -c "$gl_parse" "$GLDIR" "$TMP/gl.alias" <"$TMP/$n.out" 2>/dev/null)
     ;;
   esac
   k=0

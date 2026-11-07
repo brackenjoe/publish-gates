@@ -20,11 +20,15 @@
 # for commit-msg): private, ask, a checker failure and a URL it cannot read
 # OWNER/REPO from are all scanned, so an unset or mistyped list cannot turn
 # the gate off. The commits scanned are those reachable from the pushed tip
-# and not from the target remote's own remote-tracking refs (nor the remote's
-# current tip for that ref), so history already on the target remote never
-# blocks a push; a commit that sits only on another remote (a mirror) is still
-# scanned. When git passes a URL rather than a configured remote name there
-# are no tracking refs and every commit from the tip is scanned. A deleted ref
+# and not already on the target. "On the target" is asked of the target itself,
+# once per push and only when a ref line has a non-zero local sha:
+# `git ls-remote -- URL` (bounded by `timeout 20` when available). Every listed
+# sha that exists locally as a commit is excluded, and so is each line's own
+# remote sha. Local remote-tracking refs are not trusted: `git remote set-url`
+# can point a name at a different repo and leave its old tracking refs behind.
+# A commit that sits only on another remote (a mirror) is scanned. If
+# ls-remote fails, only the lines' remote shas are excluded: that scans more,
+# never less, and the push is not refused for the failure itself. A deleted ref
 # is skipped. If rev-list or log fails the push is refused. A cross-reference
 # hit is reported before the visibility verdict. GATES_PUBLIC_PUSH_OK does not
 # skip this scan.
@@ -32,16 +36,31 @@
 # override; an outer rule in your agent harness, if you run one, can ask
 # before those. It checks against mistakes, not a hostile contributor.
 #
-# What it does: a URL that is not on github.com (a local path, another host)
-# passes. For a github.com URL (https, git@host:path and ssh:// forms) it runs
+# What it does: the host is taken from the URL (a trailing dot is dropped). For
+# the ssh forms (git@host:path and ssh://) whose host is not already a GitHub
+# name, it is resolved with `ssh -G -- HOST` (bounded by `timeout 5` when
+# available; it connects to nothing, it only evaluates ssh config) and the
+# first "hostname" line is used, so a Host alias for github.com is judged as
+# GitHub. A host beginning with "-" is never passed to ssh. A host that is
+# still not GitHub (another host) passes, after one stderr line
+# "pre-push: not checked: host HOST is not GitHub"; a local path passes
+# silently. Only the default ssh config is read: if git is pointed at another
+# one (core.sshCommand, GIT_SSH_COMMAND or GIT_SSH with -F FILE, or another
+# program), an alias defined only there is not resolved and passes as "not
+# checked". The ls-remote runs with GIT_TERMINAL_PROMPT=0, so it never asks
+# for credentials a second time; without `timeout` it has no time limit.
+# For a github.com URL (https, git@host:path and ssh:// forms) it runs
 # check-visibility.sh OWNER REPO (once), found in the directory above this one.
 # "private" passes. "public", "ask", any other output, a nonzero exit, or a
 # URL it cannot read OWNER/REPO from is refused, because an unknown is not
-# private. Needs the network (curl, up to 20 s) on every push to GitHub.
+# private. gist.github.com is GitHub but not a repo the checker can judge: it
+# takes the unknown path (scanned, refused unless approved). Needs the network
+# (curl, up to 20 s) on every push to GitHub.
 # Approval: the owner's go-ahead is given as GATES_PUBLIC_PUSH_OK=yes on the
 # push command, exactly "yes". Any other value does not count.
-# The check script can be replaced by GATES_CHECK_VISIBILITY=PATH (the test,
-# test-git-hooks.sh, stubs it).
+# The check script can be replaced by GATES_CHECK_VISIBILITY=PATH and the ssh
+# used for host resolution by GATES_SSH=PATH (the test, test-git-hooks.sh,
+# stubs both).
 # Enable for every checkout on this machine, fork checkouts and temp clones
 # too:
 #   git config --global core.hooksPath /path/to/git-hooks
@@ -67,23 +86,51 @@ is_zero() {
     esac
 }
 
+# target_commits: prints each sha the target repo lists (git ls-remote) that
+# exists here as a commit. Prints nothing if ls-remote fails.
+target_commits() {
+    if command -v timeout >/dev/null 2>&1; then
+        _lr=$(GIT_TERMINAL_PROMPT=0 timeout 20 git ls-remote -- "$url" 2>/dev/null </dev/null) || return 0
+    else
+        _lr=$(GIT_TERMINAL_PROMPT=0 git ls-remote -- "$url" 2>/dev/null </dev/null) || return 0
+    fi
+    printf '%s\n' "$_lr" | awk 'NF {print $1}' |
+        git cat-file --batch-check 2>/dev/null | awk '$2 == "commit" {print $1}'
+}
+
+# resolve_ssh_host HOST: prints the lowercased "hostname" ssh -G reports, or
+# nothing. A host starting with "-" is never passed to ssh.
+resolve_ssh_host() {
+    case $1 in
+    -* | '') return 0 ;;
+    esac
+    if command -v timeout >/dev/null 2>&1; then
+        _g=$(timeout 5 "${GATES_SSH:-ssh}" -G -- "$1" 2>/dev/null </dev/null)
+    else
+        _g=$("${GATES_SSH:-ssh}" -G -- "$1" 2>/dev/null </dev/null)
+    fi
+    printf '%s\n' "$_g" | awk '$1 == "hostname" {print tolower($2); exit}' | sed 's/\.*$//'
+}
+
 # scan_push: reads the ref lines on stdin; prints each offending commit to
 # stderr; returns 0 clean, 1 hits or a git failure.
 scan_push() {
     bad=0
+    ls_done=0
+    remote_shas=''
     while read -r lref lsha _ rsha; do
         [ -n "${lref:-}" ] || continue
         is_zero "${lsha:-}" && continue
-        excl=''
-        remote_arg=''
-        if [ -n "${remote_name:-}" ] && [ "$remote_name" != "${url:-}" ]; then
-            remote_arg=--remotes=$remote_name
+        if [ "$ls_done" -eq 0 ]; then
+            ls_done=1
+            remote_shas=$(target_commits)
         fi
+        excl=$remote_shas
         if ! is_zero "${rsha:-}" && git cat-file -e "$rsha^{commit}" 2>/dev/null; then
-            excl=$rsha
+            excl=$(printf '%s\n%s\n' "$excl" "$rsha")
         fi
-        # shellcheck disable=SC2086
-        if ! list=$(git rev-list "$lsha" --not $remote_arg $excl 2>/dev/null); then
+        if ! list=$({ printf '%s\n' "$lsha"; printf '%s\n' "$excl" | sed -n '/./s/^/^/p'; } |
+            git rev-list --stdin 2>/dev/null); then
             echo "pre-push: refused: git rev-list failed for $lref ($lsha); an unknown is not clean" >&2
             bad=1
             continue
@@ -107,10 +154,10 @@ scan_push() {
     [ "$bad" -eq 0 ]
 }
 
-remote_name=${1:-}
 url=${2:-}
 host=''
 path=''
+viassh=0
 case $url in
 *://*)
     rest=${url#*://}
@@ -118,6 +165,7 @@ case $url in
     case $rest in */*) path=${rest#*/} ;; esac
     host=${hostpart##*@}
     host=${host%%:*}
+    case ${url%%://*} in ssh | git+ssh | ssh+git) viassh=1 ;; esac
     ;;
 *:*)
     # scp-like [user@]host:path, unless a slash comes first (a local path)
@@ -127,14 +175,35 @@ case $url in
     *)
         host=${pre##*@}
         path=${url#*:}
+        viassh=1
         ;;
     esac
     ;;
 esac
 host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+while :; do
+    case $host in
+    *.) host=${host%.} ;;
+    *) break ;;
+    esac
+done
 case $host in
-github.com | www.github.com | ssh.github.com) ;;
-*) exit 0 ;;
+github.com | www.github.com | ssh.github.com | gist.github.com) ;;
+*)
+    if [ "$viassh" -eq 1 ] && [ -n "$host" ]; then
+        resolved=$(resolve_ssh_host "$host")
+        case $resolved in
+        github.com | www.github.com | ssh.github.com | gist.github.com) host=$resolved ;;
+        esac
+    fi
+    case $host in
+    github.com | www.github.com | ssh.github.com | gist.github.com) ;;
+    *)
+        [ -z "$host" ] || echo "pre-push: not checked: host $host is not GitHub" >&2
+        exit 0
+        ;;
+    esac
+    ;;
 esac
 
 path=${path#/}
@@ -148,6 +217,11 @@ case $path in
     repo=${repo%.git}
     ;;
 esac
+# a gist is GitHub but not a repo the checker can judge: the unknown path
+if [ "$host" = gist.github.com ]; then
+    owner=''
+    repo=''
+fi
 
 word=unknown
 if [ -n "$owner" ] && [ -n "$repo" ]; then
@@ -162,6 +236,9 @@ else
     owner=${owner:-?}
     repo=${repo:-?}
 fi
+target=$owner/$repo
+[ "$host" != gist.github.com ] || target='gist.github.com (a gist, which the visibility checker cannot judge)'
+
 
 # Everything but a repo the checker calls public is scanned, listed or not.
 if [ "$word" != public ]; then
@@ -173,9 +250,9 @@ fi
 
 [ "$word" = private ] && exit 0
 if [ "${GATES_PUBLIC_PUSH_OK:-}" = yes ]; then
-    echo "pre-push: push to $owner/$repo ($word) is approved by GATES_PUBLIC_PUSH_OK=yes" >&2
+    echo "pre-push: push to $target ($word) is approved by GATES_PUBLIC_PUSH_OK=yes" >&2
     exit 0
 fi
-echo "pre-push: refused: $owner/$repo is $word, not private (a public remote needs the owner's approval on every push, because publishing cannot be undone)." >&2
+echo "pre-push: refused: $target is $word, not private (a public remote needs the owner's approval on every push, because publishing cannot be undone)." >&2
 echo "pre-push: if the owner approved this push, give it on the command: GATES_PUBLIC_PUSH_OK=yes git push ..." >&2
 exit 1

@@ -12,8 +12,8 @@
 # hooks run inside the repo). To protect a repo's history:
 #   git config --global --add gates.privateRepo OWNER/REPO
 # With the key unset the list is empty: commit-msg then enforces only where
-# there is no origin at all, and pre-push skips the cross-reference scan (it
-# still runs the visibility gate).
+# there is no origin at all. The list is used by commit-msg only; pre-push
+# scans the pushed commits whatever the list holds.
 
 # The private repos, as owner/repo, one per line, lowercased (GitHub names
 # are case-insensitive). The rule protects their history.

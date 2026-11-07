@@ -1,0 +1,181 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Joe Fernandez
+#
+# Refuse a push to a public GitHub repo unless the owner's approval is on the
+# command. A public remote needs the owner's approval on every push, because
+# publishing cannot be undone. This makes that rule a mechanism, not a habit.
+# Git passes $1 the remote name and $2 its URL and feeds the refs on stdin as
+# "<local ref> <local sha> <remote ref> <remote sha>".
+#
+# Second job: for a push to any github.com repo EXCEPT one that
+# check-visibility reports "public" (a public repo's history is public
+# anyway) it scans the full message of every commit being pushed for a GitHub
+# cross-reference (owner/repo#N, owner/repo@sha, a github.com issue, pull,
+# commit or discussions URL) and refuses the push on a hit. GitHub posts the
+# commit's title on the public item's timeline when the commit arrives, so
+# this is the gate; commit-msg is only the early catch, because git skips it
+# for `git commit -n`, cherry-pick, rebase picks, commit-tree and am
+# (githooks(5)). The scan does not depend on gates.privateRepo (that list is
+# for commit-msg): private, ask, a checker failure and a URL it cannot read
+# OWNER/REPO from are all scanned, so an unset or mistyped list cannot turn
+# the gate off. The commits scanned are those reachable from the pushed tip
+# and not from the target remote's own remote-tracking refs (nor the remote's
+# current tip for that ref), so history already on the target remote never
+# blocks a push; a commit that sits only on another remote (a mirror) is still
+# scanned. When git passes a URL rather than a configured remote name there
+# are no tracking refs and every commit from the tip is scanned. A deleted ref
+# is skipped. If rev-list or log fails the push is refused. A cross-reference
+# hit is reported before the visibility verdict. GATES_PUBLIC_PUSH_OK does not
+# skip this scan.
+# Remaining bypass: `git push --no-verify` (or --no-veri) and a hooksPath
+# override; an outer rule in your agent harness, if you run one, can ask
+# before those. It checks against mistakes, not a hostile contributor.
+#
+# What it does: a URL that is not on github.com (a local path, another host)
+# passes. For a github.com URL (https, git@host:path and ssh:// forms) it runs
+# check-visibility.sh OWNER REPO (once), found in the directory above this one.
+# "private" passes. "public", "ask", any other output, a nonzero exit, or a
+# URL it cannot read OWNER/REPO from is refused, because an unknown is not
+# private. Needs the network (curl, up to 20 s) on every push to GitHub.
+# Approval: the owner's go-ahead is given as GATES_PUBLIC_PUSH_OK=yes on the
+# push command, exactly "yes". Any other value does not count.
+# The check script can be replaced by GATES_CHECK_VISIBILITY=PATH (the test,
+# test-git-hooks.sh, stubs it).
+# Enable for every checkout on this machine, fork checkouts and temp clones
+# too:
+#   git config --global core.hooksPath /path/to/git-hooks
+# Bypass of the visibility check: the approval above. `git push --no-verify`
+# bypasses the whole hook.
+xref_lib=$(dirname "$0")/xref.sh
+if ! [ -r "$xref_lib" ]; then
+    echo "pre-push: refused: cannot read $xref_lib (an unknown is not clean)" >&2
+    exit 1
+fi
+# shellcheck source=xref.sh source-path=SCRIPTDIR
+. "$xref_lib" || {
+    echo "pre-push: refused: cannot source $xref_lib" >&2
+    exit 1
+}
+refs=$(cat)
+
+# is_zero SHA: all zeros (any hash length) or empty.
+is_zero() {
+    case $1 in
+    *[!0]*) return 1 ;;
+    *) return 0 ;;
+    esac
+}
+
+# scan_push: reads the ref lines on stdin; prints each offending commit to
+# stderr; returns 0 clean, 1 hits or a git failure.
+scan_push() {
+    bad=0
+    while read -r lref lsha _ rsha; do
+        [ -n "${lref:-}" ] || continue
+        is_zero "${lsha:-}" && continue
+        excl=''
+        remote_arg=''
+        if [ -n "${remote_name:-}" ] && [ "$remote_name" != "${url:-}" ]; then
+            remote_arg=--remotes=$remote_name
+        fi
+        if ! is_zero "${rsha:-}" && git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+            excl=$rsha
+        fi
+        # shellcheck disable=SC2086
+        if ! list=$(git rev-list "$lsha" --not $remote_arg $excl 2>/dev/null); then
+            echo "pre-push: refused: git rev-list failed for $lref ($lsha); an unknown is not clean" >&2
+            bad=1
+            continue
+        fi
+        for c in $list; do
+            if ! body=$(git log -1 --format=%B "$c" 2>/dev/null) ||
+                ! subj=$(git log -1 --format=%s "$c" 2>/dev/null); then
+                echo "pre-push: refused: git log failed for commit $c; an unknown is not clean" >&2
+                bad=1
+                continue
+            fi
+            hit=$(printf '%s\n' "$body" | xref_grep)
+            if [ -n "$hit" ]; then
+                short=$(git rev-parse --short "$c" 2>/dev/null || echo "$c")
+                echo "pre-push: refused: GitHub cross-reference in commit $short $subj" >&2
+                printf '%s\n' "$hit" | sed 's/^/pre-push:   line /' >&2
+                bad=1
+            fi
+        done
+    done
+    [ "$bad" -eq 0 ]
+}
+
+remote_name=${1:-}
+url=${2:-}
+host=''
+path=''
+case $url in
+*://*)
+    rest=${url#*://}
+    hostpart=${rest%%/*}
+    case $rest in */*) path=${rest#*/} ;; esac
+    host=${hostpart##*@}
+    host=${host%%:*}
+    ;;
+*:*)
+    # scp-like [user@]host:path, unless a slash comes first (a local path)
+    pre=${url%%:*}
+    case $pre in
+    */*) ;;
+    *)
+        host=${pre##*@}
+        path=${url#*:}
+        ;;
+    esac
+    ;;
+esac
+host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+case $host in
+github.com | www.github.com | ssh.github.com) ;;
+*) exit 0 ;;
+esac
+
+path=${path#/}
+owner=''
+repo=''
+case $path in
+*/*)
+    owner=${path%%/*}
+    repo=${path#*/}
+    repo=${repo%%/*}
+    repo=${repo%.git}
+    ;;
+esac
+
+word=unknown
+if [ -n "$owner" ] && [ -n "$repo" ]; then
+    check=${GATES_CHECK_VISIBILITY:-$(dirname "$0")/../check-visibility.sh}
+    out=$("$check" "$owner" "$repo" 2>/dev/null)
+    rc=$?
+    case $out in
+    public | ask) word=$out ;;
+    esac
+    [ "$rc" -eq 0 ] && [ "$out" = private ] && word=private
+else
+    owner=${owner:-?}
+    repo=${repo:-?}
+fi
+
+# Everything but a repo the checker calls public is scanned, listed or not.
+if [ "$word" != public ]; then
+    if ! printf '%s\n' "$refs" | scan_push; then
+        echo "pre-push: write 'owner/repo PR N' with no '#'; reword the commit (git commit --amend for the tip, or rebase) and push again" >&2
+        exit 1
+    fi
+fi
+
+[ "$word" = private ] && exit 0
+if [ "${GATES_PUBLIC_PUSH_OK:-}" = yes ]; then
+    echo "pre-push: push to $owner/$repo ($word) is approved by GATES_PUBLIC_PUSH_OK=yes" >&2
+    exit 0
+fi
+echo "pre-push: refused: $owner/$repo is $word, not private (a public remote needs the owner's approval on every push, because publishing cannot be undone)." >&2
+echo "pre-push: if the owner approved this push, give it on the command: GATES_PUBLIC_PUSH_OK=yes git push ..." >&2
+exit 1

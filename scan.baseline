@@ -1,0 +1,9 @@
+# Known findings for scan.sh (beside it). A finding whose tool, path and code
+# match a line here is "known": not printed, not counted, and does not fail
+# the commit hook. One entry per line, tab-separated:
+#   TOOL<TAB>PATH<TAB>CODE<TAB>REASON
+# TOOL is ruff, bandit, shellcheck or gitleaks; PATH is repo-relative; CODE is
+# the tool's code (F821, B602, SC2164, a gitleaks rule id). No line numbers,
+# so a new finding of the same code in the same file is masked too: prefer an
+# inline suppression with a reason for anything new. `scan.sh --all` lists
+# entries that no longer match anything.

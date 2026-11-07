@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Joe Fernandez
+#
+# Run the code scanner on a commit: ruff (syntax errors, undefined names),
+# bandit, shellcheck and gitleaks over the staged files, by calling the
+# scan.sh that sits one directory above this hook (scan.sh --staged). Refuses
+# the commit when it finds anything (exit 1) or when the scanner is not set up
+# (exit 2, with the rebuild line). The suppressions and what each tool checks
+# are in the header of scan.sh.
+#
+# Per-repo opt-in: the hook acts only in a repo where the boolean git config
+# key gates.scan is true, and exits 0 silently everywhere else. Enable it in
+# the repo to scan:
+#     git config gates.scan true
+# A worktree shares its main checkout's local config, so it is covered when the
+# main checkout is. With core.hooksPath pointing at this directory (globally,
+# if wanted) the hook runs in every repo but acts only in the enabled ones.
+# If no scan.sh sits beside the hook (an old branch), the commit passes with a
+# one-line note.
+#
+# A staged *requirements*.txt prints a reminder to run scan.sh --deps; it does
+# not block.
+# A gates.scan that is not a valid boolean refuses the commit (exit 2).
+# Bypass for one commit: git commit --no-verify.
+# Unset (git config exit 1) means off. A malformed value makes git config fail
+# with another status; an unknown is not clean, so that refuses the commit.
+gs=$(git config --type=bool --get gates.scan 2>/dev/null)
+gsrc=$?
+if [ "$gsrc" -eq 1 ]; then
+    exit 0
+elif [ "$gsrc" -ne 0 ]; then
+    echo "pre-commit: refused: gates.scan is not a boolean (git config exit $gsrc, value: $(git config --get gates.scan 2>/dev/null)); set it to true or false" >&2
+    exit 2
+fi
+case $gs in
+true) ;;
+false) exit 0 ;;
+*)
+    echo "pre-commit: refused: gates.scan has the unknown value '$gs'; set it to true or false" >&2
+    exit 2
+    ;;
+esac
+
+scan=$(dirname "$0")/../scan.sh
+if [ ! -f "$scan" ]; then
+    echo "pre-commit: no scan.sh beside the hook, scan skipped" >&2
+    exit 0
+fi
+
+git diff --cached --name-only --diff-filter=ACMR | grep -Eq '(^|/)[^/]*requirements[^/]*\.txt$' &&
+    echo "pre-commit: requirements changed: run scan.sh --deps after installing" >&2
+
+"$scan" --staged
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "pre-commit: refused (scan exit $rc); fix it, or bypass once with git commit --no-verify" >&2
+fi
+exit "$rc"

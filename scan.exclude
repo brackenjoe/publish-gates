@@ -1,0 +1,5 @@
+# Paths scan.sh does not lint. One glob per line, matched against the
+# repo-relative path with bash [[ $path == $glob ]]; * crosses /. Blank lines
+# and lines starting with # are ignored. The exclusion is for ruff, bandit and
+# shellcheck, and for gitleaks under --all. Under --staged gitleaks reads git
+# itself and ignores this list.

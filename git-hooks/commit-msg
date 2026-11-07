@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Joe Fernandez
+#
+# Refuse a commit message that GitHub would turn into a cross-reference on
+# another repo's issue or pull request: owner/repo#N, owner/repo@sha, or a
+# github.com issue, pull or commit URL. From a private repo such a
+# reference puts the commit's title on the public item's timeline. Write
+# "example/upstream PR 1235" instead. Bypass for one commit:
+# git commit --no-verify.
+# The pattern lives in xref.sh, beside this file.
+# This hook is the early catch only: git runs it for `git commit` and
+# `git merge`, not for -n, cherry-pick, rebase picks, commit-tree or am
+# (githooks(5)). The gate is pre-push, which scans the commits being pushed
+# to a private repo.
+#
+# Which repos are private: git config, multi-valued key gates.privateRepo
+# (see xref.sh). Enable the hook with
+#   git config --global core.hooksPath /path/to/git-hooks
+# for every checkout on this machine, or git config core.hooksPath in one
+# repo. To mark a repo private:
+#   git config --global --add gates.privateRepo OWNER/REPO
+# The hook enforces only where origin is one of those repos, and exits 0
+# elsewhere (checkouts of public forks, where a reference such as
+# example/upstream#15869 is intended). With the key unset it exits 0 whenever
+# there is an origin. No origin at all is enforced: a fresh repo is ours
+# until proven otherwise.
+xref_lib=$(dirname "$0")/xref.sh
+if ! [ -r "$xref_lib" ]; then
+    echo "commit-msg: refused: cannot read $xref_lib (an unknown is not clean)" >&2
+    exit 1
+fi
+# shellcheck source=xref.sh source-path=SCRIPTDIR
+. "$xref_lib" || {
+    echo "commit-msg: refused: cannot source $xref_lib" >&2
+    exit 1
+}
+origin=$(git config --get remote.origin.url 2>/dev/null)
+if [ -n "$origin" ]; then
+    u=${origin%/}
+    u=${u%.git}
+    u=$(printf '%s' "$u" | tr '[:upper:]' '[:lower:]')
+    ours=0
+    # shellcheck disable=SC2154 # set in xref.sh
+    for r in $private_repos; do
+        case $u in
+        *github.com/"$r" | *github.com:"$r") ours=1 ;;
+        esac
+    done
+    [ "$ours" -eq 1 ] || exit 0
+fi
+msg=$(grep -v '^#' "$1")
+hit=$(printf '%s\n' "$msg" | xref_grep)
+if [ -n "$hit" ]; then
+    echo "commit-msg: GitHub cross-reference in the message; write 'owner/repo PR N' with no '#':" >&2
+    printf '%s\n' "$hit" >&2
+    exit 1
+fi
+exit 0

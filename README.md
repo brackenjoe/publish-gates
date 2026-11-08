@@ -34,7 +34,8 @@ your own copy decides).
 associative arrays and `mapfile -d`; macOS ships 3.2, and `public-scan.sh`
 exits 2 naming the version), Python 3.7 or later for `check-media-metadata.py`, GNU grep with PCRE (`grep -P`; `public-scan.sh` checks at start
 and exits 2 without it), git 2.31 or later (`rev-parse --path-format`),
-coreutils `timeout` for `scan.sh --deps` and to bound `pre-push`'s network calls, curl for `check-visibility.sh`,
+coreutils `timeout` for `scan.sh --deps` and to bound `pre-push`'s network calls, curl for `check-visibility.sh`
+(and, optionally, the GitHub CLI `gh`, logged in, plus `timeout`, for its second opinion),
 ffprobe (ffmpeg) for `check-media-metadata.py` when a video is present
 (and ffmpeg with libx264, libwebp and libvpx-vp9 for its test),
 perl for `public-scan.sh`'s allow list, and gitleaks 8.30.1 or later
@@ -301,9 +302,10 @@ and runs it.
 ## check-visibility.sh
 
     check-visibility.sh OWNER REPO
-    check-visibility.sh --selftest      offline, curl replaced by a stub
+    check-visibility.sh --selftest      offline, curl and gh replaced by stubs
 
-Prints exactly one word: `public` (status 200 and `"visibility": "public"`),
+An unauthenticated request to the GitHub API (`api.github.com/repos/OWNER/REPO`)
+decides first. Prints exactly one word: `public` (status 200 and `"visibility": "public"`),
 `private` (200 and `"visibility": "private"`, or a 404 with no visibility
 field: an unauthenticated request to a private repo is a 404, and so is one
 to a repo that does not exist, so check against the remote's own URL, not a
@@ -312,6 +314,26 @@ unparsable answer). Exit 0 for public or private, 2 for ask, 1 for bad usage.
 Through some proxies a private repo can answer 200 and a public one 403; a
 200 is still judged by its body, so `public` holds and a `private` from a
 404 proves less there.
+
+When that unauthenticated call gives `ask`, and only then, it asks the
+GitHub CLI for a second opinion:
+
+    GH_HOST=github.com GH_PROMPT_DISABLED=1 timeout 20 \
+      gh repo view github.com/OWNER/REPO --json visibility -q .visibility </dev/null
+
+The host is pinned twice, so a `GH_HOST` left set for another server cannot
+redirect it; prompting is off and stdin is empty, so it can never stop a
+push hook to ask anything; the timeout is 20 s, or `GH_TIMEOUT` if that is
+a positive integer. Only an exact `PRIVATE` or
+`PUBLIC` from a successful `gh` changes the answer; anything else (not
+installed, not logged in, an error, a timeout, `INTERNAL`, other output)
+leaves `ask`. It never overrides a `public` or `private` the first check
+gave. Without a `timeout` on PATH the second opinion is skipped, and the
+selftest prints SKIP for the cases that need it (on macOS, Homebrew's
+coreutils installs it as `gtimeout` unless its gnubin directory is on
+PATH).
+`CHECK_VISIBILITY_VERBOSE=1` names the source of the answer on stderr;
+stdout stays one word.
 
 ## Tests
 

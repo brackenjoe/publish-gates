@@ -29,7 +29,9 @@
 # A commit that sits only on another remote (a mirror) is scanned. If
 # ls-remote fails, only the lines' remote shas are excluded: that scans more,
 # never less, and the push is not refused for the failure itself. A deleted ref
-# is skipped. If rev-list or log fails the push is refused. A cross-reference
+# is skipped. If rev-list, log or grep (status above 1) fails the push is
+# refused. The scan is bytewise (xref.sh: LC_ALL=C grep -a), so an invalid byte
+# on a line cannot hide a reference. A cross-reference
 # hit is reported before the visibility verdict. GATES_PUBLIC_PUSH_OK does not
 # skip this scan.
 # Remaining bypass: `git push --no-verify` (or --no-veri) and a hooksPath
@@ -44,7 +46,13 @@
 # GitHub. A host beginning with "-" is never passed to ssh. A host that is
 # still not GitHub (another host) passes, after one stderr line
 # "pre-push: not checked: host HOST is not GitHub"; a local path passes
-# silently. Only the default ssh config is read: if git is pointed at another
+# silently. A host that has a character outside [a-z0-9.-] (a %XX escape,
+# which git decodes in URL-form hosts, an IPv6 literal, an underscore) is not
+# "not GitHub" but unknown: it takes the unknown path below, scanned and
+# refused unless approved. So does a path with a segment after OWNER/REPO (one
+# trailing slash is fine; git removes /../ from an http path, so the repo
+# contacted is not the one named) and a repo named X.wiki (the wiki of X; the
+# checker's 404 would read as private). Only the default ssh config is read: if git is pointed at another
 # one (core.sshCommand, GIT_SSH_COMMAND or GIT_SSH with -F FILE, or another
 # program), an alias defined only there is not resolved and passes as "not
 # checked". The ls-remote runs with GIT_TERMINAL_PROMPT=0, so it never asks
@@ -143,6 +151,12 @@ scan_push() {
                 continue
             fi
             hit=$(printf '%s\n' "$body" | xref_grep)
+            grc=$?
+            if [ "$grc" -gt 1 ]; then
+                echo "pre-push: refused: grep failed on commit $c (status $grc); an unknown is not clean" >&2
+                bad=1
+                continue
+            fi
             if [ -n "$hit" ]; then
                 short=$(git rev-parse --short "$c" 2>/dev/null || echo "$c")
                 echo "pre-push: refused: GitHub cross-reference in commit $short $subj" >&2
@@ -187,20 +201,30 @@ while :; do
     *) break ;;
     esac
 done
+odd=0
 case $host in
 github.com | www.github.com | ssh.github.com | gist.github.com) ;;
 *)
     if [ "$viassh" -eq 1 ] && [ -n "$host" ]; then
         resolved=$(resolve_ssh_host "$host")
-        case $resolved in
-        github.com | www.github.com | ssh.github.com | gist.github.com) host=$resolved ;;
-        esac
+        # the name ssh will contact is the one to judge, alias or not
+        [ -z "$resolved" ] || host=$resolved
     fi
     case $host in
     github.com | www.github.com | ssh.github.com | gist.github.com) ;;
     *)
-        [ -z "$host" ] || echo "pre-push: not checked: host $host is not GitHub" >&2
-        exit 0
+        # %XX and the like: git may decode the host to a GitHub name, so a
+        # host outside [a-z0-9.-] is not "not GitHub", it is unknown
+        case $host in
+        *[!a-z0-9.-]*)
+            odd=1
+            echo "pre-push: host $host holds a character outside [a-z0-9.-]; treated as unknown" >&2
+            ;;
+        esac
+        if [ "$odd" -eq 0 ]; then
+            [ -z "$host" ] || echo "pre-push: not checked: host $host is not GitHub" >&2
+            exit 0
+        fi
         ;;
     esac
     ;;
@@ -214,9 +238,20 @@ case $path in
     owner=${path%%/*}
     repo=${path#*/}
     repo=${repo%%/*}
+    # GitHub names are case-insensitive: r.WIKI.git is r.wiki.git
+    repo=$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')
     repo=${repo%.git}
     ;;
 esac
+# a repo named X.wiki is the wiki of the public-or-not repo X, not a repo the
+# checker can judge (a 404 reads as private): the unknown path
+case $repo in *.wiki) owner=''; repo='' ;; esac
+# a segment after OWNER/REPO (/../PUBLIC): git may contact another repo
+case $path in */*/?*) owner=''; repo='' ;; esac
+# a % in the path: git may decode it (%2F), so OWNER and REPO are not as written
+case $path in *%*) owner=''; repo='' ;; esac
+# an undecodable host: the unknown path
+[ "$odd" -eq 0 ] || { owner=''; repo=''; }
 # a gist is GitHub but not a repo the checker can judge: the unknown path
 if [ "$host" = gist.github.com ]; then
     owner=''

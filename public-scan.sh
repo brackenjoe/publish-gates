@@ -21,6 +21,9 @@
 # `public-scan.sh: not scanned: PATH (reason)`: a tracked file deleted from the
 # work tree, a directory where a file was listed, a fifo, socket, device or
 # other special file, an unreadable file, and a name containing a newline.
+# Config in DIR cannot run a command: every git call carries -c
+# core.fsmonitor=false (a fsmonitor hook set in DIR/.git/config would otherwise
+# run on ls-files, as the user running the scan).
 # The listing itself must be complete: `find` and `git ls-files` are run with
 # their stderr and status captured, and any message (an unreadable directory,
 # say) or nonzero status is exit 2 naming the message, since a directory they
@@ -88,6 +91,10 @@
 # git@host followed by :path is not extended: that colon starts the next field.)
 # The check applies on a side only where the string itself starts or ends with a
 # letter or digit: one that begins with a dash, say, carries its own left boundary.
+# The email and IPv4 rules also accept escaped forms of the full stop and the at
+# sign (&#46; &#x2E; &period; \. and &#64; &#x40; &commat; \@); the allow
+# strings, and the line they are removed from, are decoded first, so an escaped
+# continuation (an allowed address followed by &#46;au) extends the token like a plain one.
 # Unset, nothing changes; set to a file that cannot be read, exit 2. Needs
 # perl. Hits are printed as they stand in the file, not as the remainder.
 
@@ -158,12 +165,12 @@ list_to() {
 # repository, where ls-files lists nothing: only "true" takes the git branch.
 files=()
 declare -A isgl=()
-if [ "$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
-  list_to "$work/list" git -C "$dir" ls-files -z --cached --others --exclude-standard
+if [ "$(git -c core.fsmonitor=false -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
+  list_to "$work/list" git -c core.fsmonitor=false -C "$dir" ls-files -z --cached --others --exclude-standard
   mapfile -d '' -t rel < "$work/list"
   for r in "${rel[@]}"; do files+=("$dir/$r"); done
   # gitlinks (mode 160000) are the submodule directories
-  list_to "$work/stage" git -C "$dir" ls-files -z --stage
+  list_to "$work/stage" git -c core.fsmonitor=false -C "$dir" ls-files -z --stage
   mapfile -d '' -t stg < "$work/stage"
   for e in "${stg[@]}"; do
     case $e in 160000\ *) isgl["$dir/${e#*$'\t'}"]=1 ;; esac
@@ -285,10 +292,25 @@ run_grep() {
 # -H and -I) over the remainders, and prints the original hits whose remainder
 # still matches, in grep's usual file:line:text form.
 filter_allowed() {
-  : > "$work/orig"; : > "$work/rem"
+  : > "$work/orig"; : > "$work/rem"; : > "$work/remraw"
   perl -e '
+    # the email and IPv4 rules accept escaped forms of the full stop and the at
+    # sign (&#46; &#x2E; &period; \. and the at-sign equivalents); the allow
+    # strings are removed from a decoded copy of the line, so an escaped
+    # continuation (an allowed address followed by &#46;au) extends the token like a plain one.
+    # A hit is dropped only when the raw remainder (allow strings removed from
+    # the line as it stands) and the decoded remainder both fail the rule: the
+    # decoding can shorten a value below a rule minimum, so
+    # the raw remainder keeps every rule behaving as it did without decoding.
+    # The printed hit stays the original text. No lookbehind is used for the
+    # zero runs (&#0*46;): s///g with a plain pattern has no such cap.
+    sub dec { my $v = shift;
+      $v =~ s/&#0*46;|&#[xX]0*2[eE];|&period;/./g;
+      $v =~ s/&#0*64;|&#[xX]0*40;|&commat;/\@/g;
+      $v =~ s/\\([.\@])/$1/g;
+      return $v }
     open(my $a, "<", $ARGV[0]) or exit 2; my @s;
-    while (<$a>) { chomp; s/\r\z//; push @s, $_ if length }
+    while (<$a>) { chomp; s/\r\z//; push @s, dec($_) if length }
     @s = sort { length($b) <=> length($a) } @s;
     # a boundary is checked only on a side where the string itself starts (or
     # ends) with a letter or digit; one that starts with a dash, say, brings
@@ -305,19 +327,25 @@ filter_allowed() {
     # (an IPv6 or MAC address): after an address like git@host a colon starts
     # the next field (scp-style host:path), not a longer token
     my $tr0 = q{(?:[A-Za-z0-9_%+\@-]|[.][A-Za-z0-9_%+\@-])};
-    my @re = map { my $x = $_; my $col = $x =~ /:/;
+    my $mk = sub { map { my $x = $_; my $col = $x =~ /:/;
       my $lb = $x =~ /^[A-Za-z0-9]/ ? qq{(?<!$tc)} . ($col ? $tl : q{}) : q{};
       my $rb = $x =~ /[A-Za-z0-9]\z/ ? ($col ? qq{(?!$tr)} : qq{(?!$tr0)}) : q{};
-      qr/$lb\Q$x\E$rb/ } @s;
+      qr/$lb\Q$x\E$rb/ } @_ };
+    my @re = $mk->(@s);
     open(my $o, ">", $ARGV[1]) or exit 2; open(my $r, ">", $ARGV[2]) or exit 2;
+    open(my $w, ">", $ARGV[3]) or exit 2;
     while (<STDIN>) {
       chomp; my ($f, $rest) = split /\0/, $_, 2; next unless defined $rest;
       my ($n, $t) = split /:/, $rest, 2; next unless defined $t;
       print $o "$f:$n:$t\n";
+      my $u = $t;
+      for my $re (@re) { $u =~ s/$re//g }
+      print $w "$u\n";
+      $t = dec($t);
       for my $re (@re) { $t =~ s/$re//g }
       print $r "$t\n";
-    }' "$allowstrs" "$work/orig" "$work/rem" 2>>"$gerr" || { echo "perl allow filter failed" >> "$gerr"; return 2; }
-  grep -a -n "$@" "$work/rem" 2>>"$gerr" | cut -d: -f1 > "$work/keep"
+    }' "$allowstrs" "$work/orig" "$work/rem" "$work/remraw" 2>>"$gerr" || { echo "perl allow filter failed" >> "$gerr"; return 2; }
+  { grep -a -n "$@" "$work/rem" 2>>"$gerr"; grep -a -n "$@" "$work/remraw" 2>>"$gerr"; } | cut -d: -f1 > "$work/keep"
   awk 'NR==FNR { k[$1] = 1; next } FNR in k' "$work/keep" "$work/orig"
 }
 

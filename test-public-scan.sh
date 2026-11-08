@@ -34,6 +34,8 @@
 #   allow list     a longer address, a longer IPv4 address, the exact string
 #                  alone, a second address on the line, an angle-bracketed one,
 #                  a colon extending an IPv6 or MAC address on either side
+#   audit 11-08    escaped . and @ forms next to an allowed string (exit 1), an
+#                  escaped allow string, core.fsmonitor in DIR not run
 #   deny list      PUBLIC_SCAN_DENY missing or unreadable (exit 2), a CRLF term,
 #                  a trailing-space term, comments and blanks, the term count
 #
@@ -278,6 +280,48 @@ mk al6; printf 'M0.696-x %s z\n' "$IP" > "$W/al6/a.txt"
 run "$W/al6"; expect "dash-led allow string, no allow: hit" 1 '^FAIL  IPv4 address'
 run "$W/al6" "PUBLIC_SCAN_ALLOW=$W/allow4"; expect "allow string starting with a dash, after a digit: removed, exit 0" 0 '^ok    no public-scan hits'
 run "$W/al3" "PUBLIC_SCAN_ALLOW=$W/nonexistent"; expect "PUBLIC_SCAN_ALLOW at a missing file: exit 2" 2 'PUBLIC_SCAN_ALLOW is not a readable file'
+
+# ---- audit 2026-11-08: escaped forms must not let an allow string be removed
+# from inside a longer token; the allow file may hold the escaped spelling
+printf '%s\n' "joe${AT}example.com" > "$W/allowj"
+printf '%s\n' "example.com" > "$W/allowd"
+esc() { # NAME ALLOWFILE LINE NOTE: a one-line file with the allow set must FAIL
+  mk "$1"; printf 'contact %s\n' "$3" > "$W/$1/a.txt"
+  run "$W/$1" "PUBLIC_SCAN_ALLOW=$2"; expect "$4" 1 '^FAIL  email address'
+}
+esc ae1 "$W/allowj" "joe${AT}example.com&#46;au" "allow joe@: &#46;au continuation: exit 1"
+esc ae2 "$W/allowj" "joe${AT}example.com\\.au" "allow joe@: backslash-dot continuation: exit 1"
+esc ae3 "$W/allowj" "joe${AT}example.com&period;au" "allow joe@: &period; continuation: exit 1"
+esc ae4 "$W/allowj" "joe${AT}example.com&#x2E;au" "allow joe@: &#x2E; continuation: exit 1"
+esc ae5 "$W/allowj" "x&#46;joe${AT}example.com" "allow joe@: &#46; in front: exit 1"
+esc ae6 "$W/allowd" "priv&#64;ex""ample.com" "allow example.com vs escaped-at prefix: exit 1"
+mk ae7; printf 'contact joe%sexample.com\n' "$AT" > "$W/ae7/a.txt"
+run "$W/ae7" "PUBLIC_SCAN_ALLOW=$W/allowj"; expect "plain allowed address still passes: exit 0" 0 '^ok    no public-scan hits'
+mk ae8; printf 'contact joe%sexample.com.au\n' "$AT" > "$W/ae8/a.txt"
+run "$W/ae8" "PUBLIC_SCAN_ALLOW=$W/allowj"; expect "plain .au continuation still fails: exit 1" 1 '^FAIL  email address'
+printf '%s\n' "joe&#64;exam""ple&#46;com" > "$W/allowesc"
+run "$W/ae7" "PUBLIC_SCAN_ALLOW=$W/allowesc"; expect "allow string written escaped allows its plain form: exit 0" 0 '^ok    no public-scan hits'
+run "$W/ae1" "PUBLIC_SCAN_ALLOW=$W/allowesc"; expect "escaped allow string vs &#46;au: exit 1" 1 '^FAIL  email address'
+run "$W/ae1" "PUBLIC_SCAN_ALLOW=$W/allowj"; expect "FAIL line shows the original text" 1 'joe@exam''ple\.com&#46;au'
+
+# ---- regression of the decode fix: decoding must not hide a hit from a rule
+# with a minimum length; an unrelated allow file must not change the verdict
+printf '%s\n' "nobody${AT}example.org" > "$W/allowo"
+mk dc1; printf '%s%s%s\n' 'pass' 'word = a&#46;' 'b' > "$W/dc1/a.txt"
+run "$W/dc1"; expect "short escaped assigned secret, no allow file: exit 1" 1 '^FAIL'
+run "$W/dc1" "PUBLIC_SCAN_ALLOW=$W/allowo"; expect "short escaped assigned secret, unrelated allow file: still exit 1" 1 '^FAIL'
+mk dc2; printf '%s%s%s\n' 'api_' 'key=abcd\.' 'ef' > "$W/dc2/a.txt"
+run "$W/dc2"; expect "escaped-dot key value, no allow file: exit 1" 1 '^FAIL'
+run "$W/dc2" "PUBLIC_SCAN_ALLOW=$W/allowo"; expect "escaped-dot key value, unrelated allow file: still exit 1" 1 '^FAIL'
+
+# ---- audit 2026-11-08: a fsmonitor command in DIR/.git/config must not run
+mk fsm; git -C "$W/fsm" init -q
+printf 'plain text\n' > "$W/fsm/a.txt"
+printf '#!/bin/sh\ntouch "%s/fsm-marker"\nprintf "token\\0"\n' "$W" > "$W/fsm-hook.sh"; chmod 755 "$W/fsm-hook.sh"
+git -C "$W/fsm" config core.fsmonitor "$W/fsm-hook.sh"
+run "$W/fsm"
+if [ ! -e "$W/fsm-marker" ]; then ok "core.fsmonitor in DIR config: command not run"; else bad "core.fsmonitor in DIR config: command ran"; fi
+expect "core.fsmonitor in DIR config: scan still lists the file (1 files)" 0 '\(1 files'
 
 # ---- finding 9: deny list
 mk dn; printf 'the term zebrafoo is here\n' > "$W/dn/a.txt"

@@ -53,6 +53,12 @@
 #   23 --deps does not execute a venv that git tracks; symlinked pyvenv.cfg
 #   24 --deps: packages not audited are listed and keep exit 0; any skipped
 #      venv makes the run exit 2 ("incomplete")
+#   25 --deps runs pip-audit from an empty directory: a pip/ or pip.py at the
+#      repo root cannot shadow "python -m pip"; a relative GATES_PIP_AUDIT works
+#   26 bandit sees explicitly named files under .github/, .githooks/, .gitlab/
+#   27 a file bandit cannot analyse (1200-term expression, syntax error): exit 2
+#   28 a killed bandit (no exit status) is exit 2; no .py means no bandit run
+#   29 a newline or CR in a selected path: exit 2 naming it
 #   8e a tracked .gitleaksignore does not suppress; 9b a secret in a
 #      scan.exclude path is still refused by gitleaks; 10d a malformed
 #      gates.scan refuses the commit; 13h/13i --deps with no arguments searches
@@ -269,6 +275,7 @@ vuln)     echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[{"i
 pip)      echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]},{"name":"pip","version":"24.0","vulns":[{"id":"PYSEC-9","fix_versions":["26.1"]}]}],"fixes":[]}'; exit 1 ;;
 fail)     echo "ConnectionError: no network" >&2; exit 3 ;;
 execpy)   "$PIPAPI_PYTHON_LOCATION" >/dev/null 2>&1; echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]}],"fixes":[]}'; exit 0 ;;
+pipmod)   "$PIPAPI_PYTHON_LOCATION" -m pip --version >/dev/null 2>&1; echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]}],"fixes":[]}'; exit 0 ;;
 skipdep)  echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]},{"name":"weirdpkg","skip_reason":"Dependency not found on PyPI"}],"fixes":[]}'; exit 0 ;;
 skipmany) python3 -c 'import json; print(json.dumps({"dependencies": [{"name": "p%d" % i, "skip_reason": "x"} for i in range(1, 13)], "fixes": []}))'; exit 0 ;;
 failone)  case $PIPAPI_PYTHON_LOCATION in *v1/*) echo "boom" >&2; exit 3 ;; *) echo '{"dependencies":[{"name":"requests","version":"2.0","vulns":[]}],"fixes":[]}'; exit 0 ;; esac ;;
@@ -530,6 +537,96 @@ deps failone "$TMP/v1" "$TMP/w2"
 expect "24c one venv fails, one audited: incomplete (1 audited, 1 skipped), exit 2" 2 'scan --deps: incomplete \(1 audited, 1 skipped\)' 'clean'
 deps vuln "$TMP/w1"
 expect "24d findings still exit 1" 1 'findings in 1 of 1 venvs'
+
+# 25 --------------------------------------------------------------------
+# pip-audit runs from an empty directory: a pip/ package or pip.py in the
+# directory --deps is run from must not shadow "python -m pip". The stub does
+# what pip-audit does with PIPAPI_PYTHON_LOCATION; the venv is real.
+MARK25=$TMP/mark25
+mkshadow() { # pkg|mod: R gets an untracked venv and a shadowing pip at its root
+  mkrepo
+  printf '.venv/\n' >"$R/.gitignore"
+  python3 -m venv --without-pip "$R/.venv" || exit 2
+  if [ "$1" = pkg ]; then
+    mkdir "$R/pip"; : >"$R/pip/__init__.py"; body='pip/__main__.py'
+  else body='pip.py'; fi
+  printf 'import os\nopen(os.environ["MARK25"], "a").write("shadow ran\\n")\n' >"$R/$body"
+}
+for shape in pkg mod; do
+  mkshadow "$shape"; rm -f "$MARK25"
+  OUT=$(cd "$R" && MARK25=$MARK25 STUB_MODE=pipmod GATES_PIP_AUDIT="$STUB" ./tools/scan.sh --deps 2>&1); RC=$?
+  expect "25a $shape: shadowing pip at the repo root, --deps from the root: exit 0" 0 '\.venv: .*findings'
+  [ ! -e "$MARK25" ] || bad "25a2 $shape: shadow pip not executed" "the marker was written"
+done
+# A relative GATES_PIP_AUDIT still works after the directory change.
+mkshadow mod; rm -f "$MARK25"
+REL25=$(realpath --relative-to="$R" "$STUB")
+OUT=$(cd "$R" && MARK25=$MARK25 STUB_MODE=pipmod GATES_PIP_AUDIT="$REL25" ./tools/scan.sh --deps 2>&1); RC=$?
+expect "25b relative GATES_PIP_AUDIT: exit 0" 0 '\.venv: .*findings'
+[ ! -e "$MARK25" ] || bad "25b2 shadow pip not executed (relative stub)" "the marker was written"
+
+# 25c -------------------------------------------------------------------
+# A .git/config in the scanned tree that sets core.fsmonitor to a command must
+# not get that command run by the git calls --deps makes about a venv.
+MARK25C=$TMP/mark25c
+mkrepo
+printf '.venv/\n' >"$R/.gitignore"
+python3 -m venv --without-pip "$R/.venv" || exit 2
+printf '#!/bin/sh\necho ran >>"%s"\nprintf "\\0"\n' "$MARK25C" >"$TMP/fsm25c"; chmod +x "$TMP/fsm25c"
+git -C "$R" config core.fsmonitor "$TMP/fsm25c"
+rm -f "$MARK25C"
+OUT=$(cd "$R" && STUB_MODE=clean GATES_PIP_AUDIT="$STUB" ./tools/scan.sh --deps 2>&1); RC=$?
+expect "25c core.fsmonitor in the tree's .git/config: --deps exit 0" 0 '\.venv: .*findings'
+[ ! -e "$MARK25C" ] || bad "25c2 core.fsmonitor command not run by --deps" "the marker was written"
+
+# 26 --------------------------------------------------------------------
+# bandit's default exclude list must not drop explicitly named files.
+B602_PY=$'import subprocess\n\n\ndef f(c):\n    subprocess.call(c, shell=True)\n'
+for d in .github/scripts .githooks .gitlab scripts; do
+  mkrepo; put "$d/s.py" "$B602_PY"; commit
+  expect "26a B602 under $d/: refused" 1 's\.py:5: B602'
+done
+mkrepo; put .github/scripts/s.py "$B602_PY"; commit --no-verify; scan --all
+expect "26b the same, --all: refused" 1 's\.py:5: B602'
+mkrepo; put .github/scripts/ok.py "$CLEAN_PY"; commit
+expect "26c a clean file under .github/: succeeds" 0
+
+# 27 --------------------------------------------------------------------
+# A file bandit cannot analyse is a tool error, not a clean file. A 1200-term
+# expression makes bandit raise; a file that does not parse lands in "errors".
+DEEP_PY=$(python3 -c "print('import subprocess, sys'); print('x = ' + '+'.join(['1'] * 1200)); print('subprocess.call(sys.argv[1], shell=True)')")$'\n'
+mkrepo; put d.py "$DEEP_PY"; scan --staged
+expect "27a 1200-term expression plus B602: not clean (tool error)" 2 'd\.py: exception while scanning'  
+mkrepo; put p.py $'def (:\n'; scan --staged
+expect "27b a file bandit cannot parse: tool error, exit 2" 2 'tool error'
+
+# 28 --------------------------------------------------------------------
+# A scanner killed before it writes its exit status is a tool error.
+FV=$TMP/fv28; mkdir -p "$FV/bin"
+printf '#!/bin/sh\nexec "%s/bin/ruff" "$@"\n' "$GATES_SCAN_VENV" >"$FV/bin/ruff"
+# shellcheck disable=SC2016  # $PPID is for the stub, not this shell
+printf '#!/bin/sh\nkill -9 $PPID\n' >"$FV/bin/bandit"; chmod +x "$FV/bin/ruff" "$FV/bin/bandit"
+mkrepo; put s.py "$B602_PY"
+OUT=$(cd "$R" && GATES_SCAN_VENV="$FV" ./tools/scan.sh --staged 2>&1); RC=$?
+expect "28a bandit killed: exit 2, not clean" 2 'bandit: tool error' 'scan: clean'
+# The kill stub must not matter when bandit never starts (no .py selected).
+mkrepo; put notes.txt $'hello\n'
+OUT=$(cd "$R" && GATES_SCAN_VENV="$FV" ./tools/scan.sh --staged 2>&1); RC=$?
+expect "28b a commit with only a .txt: bandit not started, exit 0" 0 'scan: clean'
+mkrepo; put x.sh "$CLEAN_SH"
+OUT=$(cd "$R" && GATES_SCAN_VENV="$FV" ./tools/scan.sh --staged 2>&1); RC=$?
+expect "28c a commit with only a .sh: exit 0" 0 'scan: clean'
+
+# 29 --------------------------------------------------------------------
+# A path with a newline could forge a baseline key or a finding line.
+mkrepo; put $'src/a.py\nb.py' "$CLEAN_PY"; scan --staged
+expect "29a newline in a staged path: exit 2 naming it" 2 'newline or carriage return.*src/a\.py' 'scan: clean'
+mkrepo; put $'x\ry.txt' $'hello\n'; scan --staged
+expect "29b carriage return in a staged path: exit 2" 2 'newline or carriage return'
+mkrepo; put $'src/a.py\nb.py' "$CLEAN_PY"; commit
+expect "29c through the hook: refused" 1 'newline or carriage return'
+mkrepo; put $'src/a.py\nb.py' "$CLEAN_PY"; commit --no-verify; scan --all
+expect "29d --all: exit 2" 2 'newline or carriage return'
 
 # timing (information only) ----------------------------------------------
 mkrepo

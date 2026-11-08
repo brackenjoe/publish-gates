@@ -91,7 +91,10 @@ commit rather than passing it.
     scan.sh --deps [VENV_DIR...]  pip-audit the venvs (needs network)
 
 Exit 0 clean, 1 findings, 2 usage or setup error (a tool or config missing,
-or under `--deps` any venv skipped).
+under `--deps` any venv skipped) or a scan that did not complete: a scanner
+that started and recorded no exit status, bandit reporting an error for a
+file or not analysing one it was given, or a selected path whose name holds a
+newline or carriage return.
 
 `--staged` and `--all` are offline and scan the **index**, not the working
 tree: for the linters the selected paths are exported with `git checkout-index`
@@ -104,7 +107,7 @@ extensionless file whose shebang ends in sh, bash or dash.
 | linter | what it checks |
 |---|---|
 | ruff | `--isolated`, only E9, F63, F7, F82: syntax errors and undefined names |
-| bandit | medium and higher severity and confidence |
+| bandit | medium and higher severity and confidence, over every selected Python file: its default excludes (`.git` anywhere in a path, so `.github/` and `.githooks/`, `.tox`, `__pycache__` and the like) are switched off, and a file it errors on or leaves out of its report is a tool error. bandit parses with the scanner venv's Python, so a file using newer syntax than that Python (or Python 2) cannot pass: rebuild the venv on a newer Python, or list the file in `scan.exclude` |
 | shellcheck | `--norc`, warning and higher |
 | gitleaks | every selected file, not only Python and shell, read as the raw blob in the index, so no `.gitattributes` (`-diff`, `binary`, an encoding) can hide one; whole files, so a secret already in a file you modify is reported too; `--redact`, so a found secret is never printed. Under `--staged`, `scan.exclude` does not apply to it, so a commit made only of excluded files, or only of type changes, still gets the secret scan |
 
@@ -131,7 +134,9 @@ format comment.
 every directory holding `pyvenv.cfg` under the top of the repository you
 run it in (outside any repository, name the venvs), else the ones named. pip, setuptools and wheel findings are reported as "venv tooling" and
 do not fail the run. A venv found by the default search that git tracks is
-never run (its `bin/python` would be the repository's code). A venv whose
+never run (its `bin/python` would be the repository's code), and pip-audit
+runs from an empty temporary directory with `PYTHONSAFEPATH=1`, so a `pip`
+package or `pip.py` in the directory you start from is not imported. A venv whose
 audit fails (no network, a pip-audit error) or that is tracked is skipped,
 and any skip makes the run exit 2 with `incomplete (M audited, S skipped)`;
 findings still exit 1. Packages pip-audit cannot look up (local or editable
@@ -170,8 +175,9 @@ cherry-pick, rebase picks, `commit-tree` or `am`, so the gate is
    `public`, it scans the full message of every commit being pushed that is
    not already on the target: listed by `git ls-remote` of the push URL,
    or the pushed ref's current tip there. It refuses the push on a
-   cross-reference, naming the commit and line. A deleted ref is skipped; a
-   `rev-list` or `log` failure refuses; if `ls-remote` fails only the tip is
+   cross-reference, naming the commit and line. The scan is bytewise, so an
+   invalid byte on a line cannot hide a reference. A deleted ref is skipped; a
+   `rev-list`, `log` or `grep` failure refuses; if `ls-remote` fails only the tip is
    exempt, so more is scanned, not less. It runs with `GIT_TERMINAL_PROMPT=0`,
    so it never asks for credentials a second time. A commit that is only on a mirror, or on the old
    repository behind a remote whose URL changed, is not exempt.
@@ -192,7 +198,15 @@ default ssh config is read: if git is pointed at another one
 (`core.sshCommand`, `GIT_SSH_COMMAND` or `GIT_SSH` with `-F FILE`, or another
 program), an alias defined only there is not resolved and passes as not
 checked. A gist push is
-refused unless approved, since the checker judges repos, not gists. Any
+refused unless approved, since the checker judges repos, not gists. So is a
+push whose host, after that resolution (the alias's `HostName` when it has
+one), holds a character outside
+`[a-z0-9.-]` (a `%XX` escape, which git decodes; an IPv6 literal; an
+underscore), whose path holds a `%` or a segment after `OWNER/REPO` (git removes
+`/../` from an http path, so the repo contacted is not the one named), or
+whose repo is named `X.wiki` in any case (the wiki of `X`, which the
+checker cannot judge): each is an unknown, and the odd host is named on
+stderr. Any
 other host passes both checks with one `pre-push: not checked: host H is
 not GitHub` line on stderr; a local path passes silently. The visibility
 check is one unauthenticated API call, up to 20 s, and the scan adds one
@@ -227,7 +241,9 @@ binary: it is named on stderr as `skipped (binary)` and not scanned, and
 the ok line counts them, `(T files, B binary skipped)`, plus links and
 submodules when there are any; images and video go
 through `check-media-metadata.py`. Matching is bytewise (`LC_ALL=C`), so no
-line is dropped for its encoding. It does not replace reading the diff; it catches what reading
+line is dropped for its encoding. git runs with `core.fsmonitor=false`, so a
+`core.fsmonitor` command set in a `.git/config` inside DIR (a copied or
+extracted tree) is not run. It does not replace reading the diff; it catches what reading
 misses.
 
 Patterns: IPv4 addresses (`127.0.0.1` and `0.0.0.0` exactly pass), global and ULA IPv6
@@ -254,7 +270,10 @@ adds terms, comma or newline separated, for an environment where no file
 can be kept. The terms are never printed except as matched lines.
 
 `PUBLIC_SCAN_ALLOW=FILE` lists exact strings you publish on purpose, one per
-line. On a hit, every allow string is removed from the line and the rule is
+line. On a hit, the Markdown and HTML escape forms the email and IPv4
+rules accept (`&#46;`, `&#x2e;`, `&period;`, `&#64;`, `&#x40;`, `&commat;`,
+zero-padded forms, a backslash before `.` or `@`) are decoded in a copy of the line and in the allow strings, then
+every allow string is removed from that copy and the rule is
 tested on what is left, so an allowed address passes and a second, different
 address on the same line still fails. A string is removed only as a whole
 token: allowing an address does not hide a longer one it is part of (a
@@ -268,9 +287,12 @@ one without a colon, such as `git@github.com`, still passes before
 
 ## check-media-metadata.py
 
-    python3 -I check-media-metadata.py [-v] PATH...
+    python3 -I check-media-metadata.py [-v] [--] PATH...
 
-Each PATH is a file or a directory, walked. Every plain file is opened and
+`-h` alone prints the help. An option that is also the name of an existing
+file (a file called `-v` or `-h` that a glob expanded) is a usage error, so
+such a file cannot turn the run into a pass. `--` ends the options: put it
+before a glob, or pass the directory. Each PATH is a file or a directory, walked. Every plain file is opened and
 told apart by its first bytes: JPEG, PNG, WebP, GIF, the MP4 family or
 Matroska/WebM. The name decides only two things: a camera sidecar name
 (`.srt`, `.lrv`, `.thm` and the like) is refused, and a media name over
@@ -281,8 +303,15 @@ it is on the list, so what is unknown is refused too: EXIF and XMP (which
 carry GPS and the camera), Photoshop and C2PA segments, a JPEG or GIF
 comment, a `uuid` box in any walked container, bytes behind the end of the
 image. Video is read with `ffprobe`; only a handful of container tags pass,
-`title` and `comment` among them, with their values unread, and so does a
-PNG `Title`, `Software` or `Comment` text chunk: the gate is for the tags
+`title` and `comment` among them, with their values unread. The MP4 tag list
+(`ilst`, `keys`) and Matroska `Tags` are also read by the gate itself, wherever
+they sit, so a tag ffprobe does not list is still judged: an MP4 `meta` must
+start with its `hdlr`, its items may be only title, comment and encoder,
+plus freeform and `keys` entries named on the container tag list, and
+a Matroska binary tag is refused. Artist, album and date tags are refused
+with the rest. A `.mov` from ffmpeg is refused for its QuickTime boxes, which
+are outside the MP4 allow-list. A PNG `Title`, `Software` or `Comment` text
+chunk passes, its value unread, like the video title: the gate is for the tags
 that carry location and device, not for what you wrote yourself. Text files
 with the extensions `.svg .css .html .htm .xml .txt .json .js .webmanifest
 .md .markdown` are refused when they hold a `data:image/`, `data:video/` or

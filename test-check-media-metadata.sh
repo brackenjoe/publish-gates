@@ -47,7 +47,15 @@
 #       trailing moof holding only a uuid, an mfra holding udta/(c)xyz refused
 #   S8  .md with a data:image/ URI refused; a plain .md passes
 #   S9  a link given with a trailing slash is refused unopened
-#   E1  no PATH, an unknown option: exit 2 and usage on stderr
+#   V9  ilst and keys parsed here, not left to ffprobe: ffmpeg's own MP4, keys
+#       MP4 and M4A pass; no hdlr, hdlr late or twice, data_type 13, a data
+#       atom past its item, an unlisted item, a location key, a bad key index
+#       and a freeform LOCATION refused
+#   V10 Matroska Tags parsed: ffmpeg's own Matroska and WebM pass; late Tags,
+#       an unmatched TagTrackUID, TagBinary, nested SimpleTags and an unknown
+#       size refused
+#   E1  no PATH, an unknown option: exit 2 and usage on stderr; -h with any
+#       other argument is exit 2, -h alone is help, -- ends the options
 #   E2  a video present and no ffprobe on PATH: exit 2 naming ffprobe; a JPEG
 #       alone does not need it
 #   E3  a PATH that does not exist, and (unless root) an unreadable directory:
@@ -120,6 +128,12 @@ q ffmpeg -y -loglevel error "${SRC[@]}" -c:v libx264 -pix_fmt yuv420p -movflags 
 mp4 "$F/v3-make.mp4" -movflags use_metadata_tags -metadata make=AcmeCam
 q ffmpeg -y -loglevel error "${SRC[@]}" -c:v libvpx-vp9 -b:v 100k "$F/v6-clean.webm" || fatal "webm"
 q ffmpeg -y -loglevel error "${SRC[@]}" -c:v libx264 -pix_fmt yuv420p "$W/src/clean.mkv" || fatal "mkv"
+
+mp4 "$F/v9-own.mp4" -metadata title=Demo -metadata comment="Made with an editor"
+mp4 "$F/v9-own-keys.mp4" -movflags use_metadata_tags -metadata title=Demo -metadata comment="Made with an editor"
+q ffmpeg -y -loglevel error -f lavfi -i sine=duration=1 -c:a aac -metadata title=Demo -metadata comment="Made with an editor" "$F/v9-own.m4a" || fatal "m4a"
+q ffmpeg -y -loglevel error "${SRC[@]}" -c:v libx264 -pix_fmt yuv420p -metadata title=Demo -metadata comment="Made with an editor" "$F/v9-own.mkv" || fatal "mkv with tags"
+q ffmpeg -y -loglevel error "${SRC[@]}" -c:v libvpx-vp9 -b:v 100k -metadata title=Demo "$F/v9-own.webm" || fatal "webm with tags"
 
 "$PY" -I - "$W/src" "$F" <<'PY' || fatal "byte fixtures"
 import os, struct, sys, zlib
@@ -259,6 +273,55 @@ attach = b'\x19\x41\xa4\x69' + bytes([0x80 | 10]) + b'\xff' * 10
 resized = k[:si + 4] + ((1 << (7 * sn)) | (ssize + len(attach))).to_bytes(sn, 'big') + k[si + 4 + sn:]
 wr('v7-attachments.mkv', resized + attach)
 
+# ---- MP4 ilst and keys. The base's moov is last, so its udta is replaced without moving an offset.
+PLACE = b'Fictown +12.3456-065.4321'                      # a value that must never be printed
+kids, i = [], mo + 8
+while i < mo + ms:
+    n = struct.unpack('>I', m[i:i + 4])[0]
+    kids.append((m[i + 4:i + 8], m[i:i + n]))
+    i += n
+with_udta = lambda payload: m[:mo] + box(b'moov', b''.join(b for t, b in kids if t != b'udta') + box(b'udta', payload))
+hdlr_dir = box(b'hdlr', bytes(8) + b'mdir' + b'appl' + bytes(9))
+hdlr_mdta = box(b'hdlr', bytes(8) + b'mdta' + bytes(13))
+data = lambda d, t=1: box(b'data', struct.pack('>II', t, 0) + d)
+item = lambda kind, d, t=1: box(kind, data(d, t))
+ilst = lambda *items: box(b'ilst', b''.join(items))
+meta = lambda *parts: box(b'meta', bytes(4) + b''.join(parts))
+keys = lambda *names: box(b'keys', bytes(4) + struct.pack('>I', len(names)) + b''.join(box(b'mdta', n) for n in names))
+free = lambda name, d: box(b'----', box(b'mean', bytes(4) + b'com.apple.iTunes') + box(b'name', bytes(4) + name) + data(d))
+def mp4u(n, *parts):
+    wr(n, with_udta(meta(*parts)))
+mp4u('v9-ok.mp4', hdlr_dir, ilst(item(b'\xa9nam', b'Demo'), item(b'\xa9too', b'Lavf'), item(b'\xa9cmt', b'Hi')))
+mp4u('v9-ilst-only.mp4', ilst(item(b'\xa9xyz', PLACE)))
+mp4u('v9-ilst-only-title.mp4', ilst(item(b'\xa9nam', PLACE)))
+mp4u('v9-ilst-first.mp4', ilst(item(b'\xa9nam', b'Demo')), hdlr_dir)
+mp4u('v9-two-hdlr.mp4', hdlr_dir, hdlr_dir, ilst(item(b'\xa9nam', b'Demo')))
+mp4u('v9-type13.mp4', hdlr_dir, ilst(item(b'\xa9nam', PLACE, 13)))
+lying = struct.pack('>I', 16 + len(PLACE) + 100) + b'data' + struct.pack('>II', 1, 0) + PLACE
+mp4u('v9-oversize.mp4', hdlr_dir, ilst(box(b'\xa9nam', lying)))
+mp4u('v9-xyz.mp4', hdlr_dir, ilst(item(b'\xa9xyz', PLACE)))
+mp4u('v9-zzz.mp4', hdlr_dir, ilst(item(b'\xa9zzz', PLACE)))
+mp4u('v9-keys-location.mp4', hdlr_mdta, keys(b'com.apple.quicktime.location.ISO6709'), ilst(item(b'\x00\x00\x00\x01', PLACE)))
+mp4u('v9-keys-badindex.mp4', hdlr_mdta, keys(b'title'), ilst(item(b'\x00\x00\x00\x02', PLACE)))
+mp4u('v9-keys-nohdlr.mp4', keys(b'title'), ilst(item(b'\x00\x00\x00\x01', b'Demo')))
+mp4u('v9-free-location.mp4', hdlr_dir, ilst(free(b'LOCATION', PLACE)))
+mp4u('v9-free-comment.mp4', hdlr_dir, ilst(free(b'comment', b'Hi')))
+
+# ---- Matroska Tags, appended behind the Cluster with no SeekHead entry (ffprobe never lists them)
+evint = lambda n: b'\x01' + n.to_bytes(7, 'big')
+el = lambda ident, d: ident + evint(len(d)) + d
+simple = lambda name, extra=b'': el(b'\x67\xc8', el(b'\x45\xa3', name) + el(b'\x44\x87', PLACE) + extra)
+tag = lambda *parts, targets=b'': el(b'\x73\x73', el(b'\x63\xc0', targets) + b''.join(parts))
+tags = lambda *parts: el(b'\x12\x54\xc3\x67', b''.join(parts))
+def mkv_plus(n, extra):
+    wr(n, k[:si + 4] + ((1 << (7 * sn)) | (ssize + len(extra))).to_bytes(sn, 'big') + k[si + 4 + sn:] + extra)
+mkv_plus('v9-tags-ok.mkv', tags(tag(simple(b'TITLE', simple(b'ENCODER')))))
+mkv_plus('v9-tags-location.mkv', tags(tag(simple(b'LOCATION'))))
+mkv_plus('v9-tags-unmatched.mkv', tags(tag(simple(b'LOCATION'), targets=el(b'\x63\xc5', (9999).to_bytes(2, 'big')))))
+mkv_plus('v9-tags-binary.mkv', tags(tag(simple(b'TITLE', el(b'\x44\x85', b'\x01\x02')))))
+mkv_plus('v9-tags-nested.mkv', tags(tag(simple(b'TITLE', simple(b'GPS')))))
+mkv_plus('v9-tags-unknown.mkv', tags(b'\x73\x73\x01' + b'\xff' * 7 + simple(b'TITLE')))
+
 # ---- text and binary files
 wr('s2-telemetry.srt', b'1\n00:00:00,000 --> 00:00:01,000\nGPS 12.3456 -65.4321\n\n')
 wr('s2-clip.lrv', b'plain text in a sidecar name\n')
@@ -330,6 +393,33 @@ refuse "V8c uuid box inside a traf refused" v8-traf-uuid.mp4 "box uuid inside tr
 refuse "V8d trailing moof holding only a uuid refused" v8-trailing-moof.mp4 "box uuid inside moof"
 refuse "V8e mfra holding udta/(c)xyz refused" v8-mfra-udta.mp4 "box udta inside mfra is not on the allow-list" "12.3456"
 
+clean "V9a ffmpeg's own MP4 (title, comment, default encoder in ilst) passes" v9-own.mp4
+clean "V9b ffmpeg's own MP4 with keys (use_metadata_tags) passes" v9-own-keys.mp4
+clean "V9c ffmpeg's own M4A passes" v9-own.m4a
+clean "V9d ilst with (c)nam, (c)too, (c)cmt after hdlr passes" v9-ok.mp4
+clean "V9e a freeform ---- item named comment passes" v9-free-comment.mp4
+refuse "V9f meta with an ilst and no hdlr refused" v9-ilst-only.mp4 "box meta has no hdlr" "Fictown"
+refuse "V9g meta with an allowed item and no hdlr refused" v9-ilst-only-title.mp4 "box meta has no hdlr" "Fictown"
+refuse "V9h hdlr behind ilst refused" v9-ilst-first.mp4 "hdlr is not its first child"
+refuse "V9i two hdlr refused" v9-two-hdlr.mp4 "more than one hdlr"
+refuse "V9j an item with data_type 13 refused" v9-type13.mp4 "only data type 1 is allowed" "Fictown"
+refuse "V9k a data atom larger than its item refused" v9-oversize.mp4 "runs past its item" "Fictown"
+refuse "V9l a (c)xyz item in the normal layout refused, named by its 4CC" v9-xyz.mp4 "ilst item ©xyz is not on the allow-list" "12.3456"
+refuse "V9m an unlisted (c)zzz item refused, named by its 4CC" v9-zzz.mp4 "ilst item ©zzz is not on the allow-list" "Fictown"
+refuse "V9n a keys entry com.apple.quicktime.location.ISO6709 refused" v9-keys-location.mp4 "keys entry tag com.apple.quicktime.location.ISO6709 (location or device metadata)" "Fictown"
+refuse "V9o an ilst item whose key index is not in keys refused" v9-keys-badindex.mp4 "ilst item index 2: its key is missing or not allowed" "Fictown"
+refuse "V9p keys and ilst with no hdlr refused" v9-keys-nohdlr.mp4 "box meta has no hdlr"
+refuse "V9q a freeform item named LOCATION refused" v9-free-location.mp4 "ilst freeform item tag LOCATION (location or device metadata)" "Fictown"
+
+clean "V10a ffmpeg's own Matroska (title, comment, stream tags) passes" v9-own.mkv
+clean "V10b ffmpeg's own WebM with a title passes" v9-own.webm
+clean "V10c Tags behind the Cluster with allowed names, nested too, pass" v9-tags-ok.mkv
+refuse "V10d late Tags (behind the Cluster, no SeekHead entry) with LOCATION refused" v9-tags-location.mkv "Matroska tag LOCATION (location or device metadata)" "Fictown"
+refuse "V10e Tags aimed at a TagTrackUID that matches nothing refused" v9-tags-unmatched.mkv "Matroska tag LOCATION (location or device metadata)" "Fictown"
+refuse "V10f TagBinary refused" v9-tags-binary.mkv "TagBinary element inside Matroska Tags"
+refuse "V10g a nested SimpleTag GPS refused" v9-tags-nested.mkv "Matroska tag GPS (location or device metadata)" "Fictown"
+refuse "V10h an element of unknown size inside Tags refused" v9-tags-unknown.mkv "unknown size inside Matroska Tags"
+
 # ---------------------------------------------------------------- links, names, text
 mkdir -p "$W/links"
 cp "$F/j1-clean.jpg" "$W/links/real.jpg"
@@ -399,6 +489,49 @@ else bad "E1a no PATH" "exit $RC: $OUT"; fi
 run --bogus "$F/p1-clean.png"
 if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q '^usage: '; then ok "E1b unknown option: exit 2 and usage"
 else bad "E1b unknown option" "exit $RC: $OUT"; fi
+run
+if printf '%s' "$OUT" | grep -qF 'usage: check-media-metadata.py [-v] [--] PATH...'; then ok "E1c the usage line shows [--]"
+else bad "E1c usage line" "$OUT"; fi
+run "$F/j3-exif.jpg" -h
+if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q '^usage: '; then ok "E1d PATH then -h: exit 2, not help"
+else bad "E1d PATH then -h" "exit $RC: $OUT"; fi
+run -h "$F/j3-exif.jpg"
+if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q '^usage: '; then ok "E1e -h then PATH: exit 2, not help"
+else bad "E1e -h then PATH" "exit $RC: $OUT"; fi
+run "$F/j3-exif.jpg" --help
+if [ "$RC" -eq 2 ]; then ok "E1f PATH then --help: exit 2"
+else bad "E1f PATH then --help" "exit $RC: $OUT"; fi
+run -h
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qF 'Refuse images and videos'; then ok "E1g -h alone: help, exit 0"
+else bad "E1g -h alone" "exit $RC: $OUT"; fi
+mkdir "$W/dash"
+cp "$F/j3-exif.jpg" "$W/dash/-h"
+OUT=$(cd "$W/dash" && "$PY" -I "$TOOL" -- -h 2>&1); RC=$?
+if [ "$RC" -eq 1 ] && [ "$OUT" = "-h: APP1 segment: EXIF" ]; then ok "E1h -- ends the options: a file named -h is checked"
+else bad "E1h -- -h" "exit $RC: $OUT"; fi
+OUT=$(cd "$W/dash" && "$PY" -I "$TOOL" -v -- -h 2>&1); RC=$?
+if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qF -- '-h: APP1 segment: EXIF'; then ok "E1i -v then -- then -h: the file is checked"
+else bad "E1i -v -- -h" "exit $RC: $OUT"; fi
+
+# An option-shaped name that is also a file: a glob must not turn it into a flag.
+mkdir "$W/optv"
+cp "$F/j3-exif.jpg" "$W/optv/-v"
+cp "$F/s4-notes.txt" "$W/optv/ok.txt"
+OUT=$(cd "$W/optv" && "$PY" -I "$TOOL" * 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -qF 'both an option and a file' && printf '%s' "$OUT" | grep -qF -- '--'; then ok "E1j a file named -v under a glob: exit 2, not the flag"
+else bad "E1j * with a file named -v" "exit $RC: $OUT"; fi
+OUT=$(cd "$W/optv" && "$PY" -I "$TOOL" -- * 2>&1); RC=$?
+if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qF -- '-v: APP1 segment: EXIF'; then ok "E1k -- * with a file named -v: the file is checked"
+else bad "E1k -- * with -v" "exit $RC: $OUT"; fi
+mkdir "$W/opth"
+cp "$F/j3-exif.jpg" "$W/opth/-h"
+cp "$F/s4-notes.txt" "$W/opth/ok.txt"
+OUT=$(cd "$W/opth" && "$PY" -I "$TOOL" * 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -qF 'both an option and a file'; then ok "E1l a file named -h under a glob: exit 2"
+else bad "E1l * with a file named -h" "exit $RC: $OUT"; fi
+OUT=$(cd "$F" && "$PY" -I "$TOOL" -v j1-clean.jpg 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qF 'checked 1 '; then ok "E1m -v PATH with no file named -v: verbose, as before"
+else bad "E1m -v PATH" "exit $RC: $OUT"; fi
 
 mkdir "$W/nobin"
 OUT=$(PATH="$W/nobin" "$PY" -I "$TOOL" "$F/v1-clean.mp4" 2>&1); RC=$?

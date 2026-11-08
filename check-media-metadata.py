@@ -3,9 +3,15 @@
 # Copyright (C) 2026 Joe Fernandez
 """Refuse images and videos that carry location or device metadata.
 
-    python3 -I check-media-metadata.py [-v] PATH...
+    python3 -I check-media-metadata.py [-v] [--] PATH...
+    python3 -I check-media-metadata.py -h
 
-Each PATH is a file or a directory, walked. A symbolic link, or anything else
+Each PATH is a file or a directory, walked. -- ends the options, so a PATH that
+starts with a dash follows it. Put -- before a glob (`-- *`), or pass the
+directory: an argument that is -v, --verbose, -h or --help and also names an
+existing file is a usage error (exit 2), not a flag. -h or --help is help only as the sole argument;
+with any other argument it is a usage error (exit 2), never a way to skip the
+check. A symbolic link, or anything else
 that is not a plain file, is a finding and is never opened or followed. Every
 plain file is opened and told apart by its first bytes, whatever its name;
 the name only decides two things (see "Sidecars" and "Cannot be read").
@@ -69,13 +75,28 @@ its format's list, so what is unknown is refused too, harmful or not.
          dinf edts udta mvex moof traf mfra and meta (a full box: its 4 version and flag bytes
          are skipped) any child not on that container's list (see BMFF_CHILDREN;
          meta may hold only hdlr, ilst and keys, never xml, bxml, iinf, iloc or
-         idat). ilst and keys are left to ffprobe; other boxes are leaves and are
-         not parsed past their header. A free, skip or wide box at any depth
+         idat). A meta box must start with its one hdlr, and may hold one ilst
+         and one keys. ilst and keys are parsed here, not left to ffprobe (which
+         skips an item when hdlr is missing or late, or its data type is odd):
+         an ilst item passes only if it is (c)too (encoder), (c)nam (title) or
+         (c)cmt (comment), or a ---- freeform item whose name is on the tag
+         list above, and holds one well-formed UTF-8 data atom inside the item;
+         any other item is named by its 4CC, never its value. A keys entry
+         passes only if its last dotted part is on the tag list and it names
+         nothing location or device; with keys, an ilst item is an index into
+         them and passes if its key does. Other boxes are leaves and are not
+         parsed past their header. A free, skip or wide box at any depth
          whose payload is not all zero bytes.
          For Matroska and WebM the EBML header and the Segment are read: refused
          are a Segment of unknown size (it cannot be checked), any bytes behind
          the Segment, and an Attachments element (ID 0x1941A469) among the
-         Segment's top-level children, which are walked by ID and size only.
+         Segment's top-level children, which are walked by ID and size. Every
+         Tags element among them, wherever it sits (ffprobe skips one behind the
+         Clusters with no index entry, or one whose target matches nothing), is
+         parsed: each SimpleTag name, nested ones too, must be an allowed tag
+         as above; a TagBinary anywhere in Tags, a SimpleTag with no name, and a
+         malformed or unknown-size element in Tags are refused. Targets are not
+         read: every Tag is checked.
   tail   bytes behind the end of a JPEG, PNG, WebP or GIF are refused unless
          they are only NUL or white space, and an EXIF, XMP, JUMBF or Photoshop
          signature among them is named.
@@ -101,14 +122,14 @@ data:audio/ URI (an inline picture is not decoded here), and an .svg also for
 construct and its line number are printed, never the text. Clean text is passed
 and listed by -v as skipped.
 
-What this does not check: the contents of an inline picture or of an ilst or keys
-box (ffprobe's tags are checked, not the pictures behind them); the values of the
+What this does not check: the contents of an inline picture or of an ilst
+box (cover art in covr is refused as an item, not decoded); the values of the
 free-text tags that are allowed (title, comment, handler_name, vendor_id, PNG
 Title, Software and Comment): a place name written there passes; the inside of an
 ICC profile, or of an APP0, APP2 or APP14 segment past its prefix; a PDF, font or
 other binary (refused unread); text in any file but the eleven extensions above;
 data: URIs other than image, video and audio; Matroska elements inside the
-Segment other than Attachments (ffprobe reads the tags); and anything behind a
+Segment other than Attachments and Tags (Chapters are left to ffprobe); and anything behind a
 base64 or other encoding in text.
 """
 import json
@@ -176,6 +197,10 @@ BMFF_CHILDREN = {
     b'meta': {b'hdlr', b'ilst', b'keys'},
 }
 BMFF_PADDING = {b'free', b'skip', b'wide'}
+# ilst items ffmpeg writes for the allowed tags: encoder, title, comment ((c) is byte 0xA9).
+ILST_ALLOW = {b'\xa9too': 'encoder', b'\xa9nam': 'title', b'\xa9cmt': 'comment'}
+ILST_DATA_TYPES = {1}           # well-known type 1: UTF-8 text. Images, integers and the rest are refused
+MAX_ILST = 4 << 20              # an ilst or keys box bigger than this is not read
 MAX_BOX_FINDINGS = 100          # a walk stops after this many
 IMAGE_BRANDS = {b'heic', b'heix', b'heim', b'heis', b'hevc', b'hevx', b'hevm', b'hevs',
                 b'mif1', b'msf1', b'avif', b'avis', b'avci', b'avcs'}
@@ -482,6 +507,13 @@ def bad_tag(key):
     return False
 
 
+def safe_name(key, n=64):
+    """A tag name as printed: control characters escaped, long names cut."""
+    key = key.strip()
+    text = ''.join(c if c.isprintable() else '\\x%02x' % ord(c) for c in key[:n])
+    return text + ('...' if len(key) > n else '')
+
+
 def tag_findings(where, tags):
     out = []
     for key in sorted(tags or {}):
@@ -491,9 +523,9 @@ def tag_findings(where, tags):
         if low == 'xmp':
             out.append('%s tag xmp: an XMP packet, where location and device fields travel' % where)
         elif bad_tag(low):
-            out.append('%s tag %s (location or device metadata)' % (where, key.strip()))
+            out.append('%s tag %s (location or device metadata)' % (where, safe_name(key)))
         else:
-            out.append('%s tag %s is not on the allow-list' % (where, key.strip()))
+            out.append('%s tag %s is not on the allow-list' % (where, safe_name(key)))
     return out
 
 
@@ -510,7 +542,7 @@ def all_zero(f, start, length):
     return True
 
 
-def bmff_walk(f, pos, end, parent, out, brands):
+def bmff_walk(f, pos, end, parent, out, brands, meta=None):
     """Walk the boxes in f[pos:end]; parent is the container's type, None at the top level."""
     top = parent is None
     allowed = BMFF_TOP_OK if top else BMFF_CHILDREN[parent]
@@ -542,6 +574,10 @@ def bmff_walk(f, pos, end, parent, out, brands):
                 out.append('%d bytes from byte %d on, inside %s, are not a complete box: a box that runs past its container, or appended data'
                            % (end - pos, pos, where))
             return
+        if meta is not None:                      # the children of a meta box, for meta_findings
+            meta['order'].append(kind)
+            if kind in (b'ilst', b'keys'):
+                meta.setdefault(kind, []).append((pos + hlen, bsize - hlen))
         name = shown(kind)
         padding = kind in BMFF_PADDING and parent != b'meta'
         if kind not in allowed and not padding:
@@ -561,12 +597,134 @@ def bmff_walk(f, pos, end, parent, out, brands):
             if start > pos + bsize:
                 out.append('box %s inside %s is too short for its header' % (name, where))
             else:
-                bmff_walk(f, start, pos + bsize, kind, out, brands)
+                state = {'order': []} if kind == b'meta' else None
+                bmff_walk(f, start, pos + bsize, kind, out, brands, state)
+                if state is not None:
+                    meta_findings(f, state, out)
         elif top and kind == b'ftyp' and not brands:
             f.seek(pos + hlen)
             payload = f.read(min(bsize - hlen, 4096))
             brands.extend([payload[:4]] + [payload[k:k + 4] for k in range(8, len(payload) - 3, 4)])
         pos += bsize
+
+
+def fourcc(b):
+    """A four-character code as printed: ASCII and the (c) byte as they are, the rest escaped."""
+    return ''.join(chr(c) if 0x20 <= c < 0x7f or c == 0xA9 else '\\x%02x' % c for c in b)
+
+
+def key_findings(key):
+    """A keys entry passes if its last dotted part is an allowed tag and nothing in it is location or device."""
+    low = key.lower().strip()
+    if low.rsplit('.', 1)[-1] in TAG_ALLOW and not bad_tag(low):
+        return []
+    return tag_findings('keys entry', {key: 1}) or ['keys entry %s is not on the allow-list' % safe_name(key)]
+
+
+def keys_parse(data, out):
+    """The allowed flag of each keys entry, in order; findings for what is malformed."""
+    if len(data) < 8:
+        out.append('box keys is too short to hold its entry count')
+        return []
+    count = int.from_bytes(data[4:8], 'big')
+    pos = 8
+    ok = []
+    while len(ok) < count:
+        size = int.from_bytes(data[pos:pos + 4], 'big') if pos + 8 <= len(data) else 0
+        if size < 8 or pos + size > len(data):
+            out.append('box keys: entry %d is malformed or runs past the box, so its keys cannot be checked' % (len(ok) + 1))
+            return ok
+        why = key_findings(data[pos + 8:pos + size].decode('utf-8', 'replace'))
+        out.extend(why)
+        ok.append(not why)
+        pos += size
+    if pos != len(data):
+        out.append('box keys: %d bytes behind its last entry' % (len(data) - pos))
+    return ok
+
+
+def ilst_item(kind, body, out):
+    """Check one ilst item's children: one UTF-8 data atom, and for ---- a name (and at most one mean)."""
+    pos = 0
+    kids = []
+    free = kind == b'----'
+    label = fourcc(kind) if kind else 'by key'
+    while pos < len(body):
+        size = int.from_bytes(body[pos:pos + 4], 'big') if pos + 8 <= len(body) else 0
+        if size < 8 or pos + size > len(body):
+            out.append('ilst item %s: a child atom is malformed or runs past its item' % label)
+            return
+        kids.append((body[pos + 4:pos + 8], body[pos + 8:pos + size]))
+        pos += size
+    types = [t for t, _ in kids]
+    want = {b'data', b'mean', b'name'} if free else {b'data'}
+    if (any(t not in want for t in types) or types.count(b'data') != 1 or types.count(b'mean') > 1
+            or types.count(b'name') != int(free)):
+        out.append('ilst item %s must hold one data atom%s, found %s'
+                   % (label, ' with one name and at most one mean' if free else '',
+                      ', '.join(fourcc(t) for t in types) or 'nothing'))
+        return
+    for t, payload in kids:
+        if t == b'data':
+            if len(payload) < 8 or payload[0] != 0 or int.from_bytes(payload[1:4], 'big') not in ILST_DATA_TYPES:
+                out.append('ilst item %s: data atom is not well-formed UTF-8 text (only data type 1 is allowed)' % label)
+        elif t == b'name':
+            if len(payload) < 4:
+                out.append('ilst item ----: name atom is too short')
+            else:
+                name = payload[4:].decode('utf-8', 'replace').strip('\x00 ')
+                out.extend(tag_findings('ilst freeform item', {name: 1}))
+
+
+def ilst_findings(data, keys_ok, out):
+    pos = 0
+    while pos < len(data):
+        size = int.from_bytes(data[pos:pos + 4], 'big') if pos + 8 <= len(data) else 0
+        if size < 8 or pos + size > len(data):
+            out.append('box ilst: %d bytes from byte %d on are not a complete item' % (len(data) - pos, pos))
+            return
+        kind = data[pos + 4:pos + 8]
+        if keys_ok is not None:                   # with keys, the type is a 1-based index into them
+            index = int.from_bytes(kind, 'big')
+            allowed = 1 <= index <= len(keys_ok) and keys_ok[index - 1]
+            if not allowed:
+                out.append('ilst item %s: its key is missing or not allowed'
+                           % ('index %d' % index if index < 1 << 20 else fourcc(kind)))
+        else:
+            allowed = kind in ILST_ALLOW or kind == b'----'
+            if not allowed:
+                out.append('ilst item %s is not on the allow-list (encoder, title, comment and ---- freeform tags only)'
+                           % fourcc(kind))
+        if allowed:
+            ilst_item(kind if keys_ok is None else b'', data[pos + 8:pos + size], out)
+        pos += size
+
+
+def meta_findings(f, state, out):
+    """Check a meta box after its children are walked: hdlr first and alone, ilst and keys read here."""
+    order = state['order']
+    if b'hdlr' not in order:
+        out.append('box meta has no hdlr: ffprobe skips its items, so they cannot be checked')
+    elif order[0] != b'hdlr':
+        out.append('box meta: hdlr is not its first child, so ffprobe skips its items')
+    if order.count(b'hdlr') > 1:
+        out.append('box meta holds more than one hdlr')
+    for kind in (b'ilst', b'keys'):
+        if len(state.get(kind, [])) > 1:
+            out.append('box meta holds more than one %s' % kind.decode('latin-1'))
+    parts = {}
+    for kind in (b'keys', b'ilst'):
+        if kind in state:
+            start, length = state[kind][0]
+            if length > MAX_ILST:
+                out.append('box %s is larger than %d MiB, so it is not read and cannot be checked'
+                           % (kind.decode('latin-1'), MAX_ILST >> 20))
+            else:
+                f.seek(start)
+                parts[kind] = f.read(length)
+    keys_ok = keys_parse(parts[b'keys'], out) if b'keys' in parts else None
+    if b'ilst' in parts:
+        ilst_findings(parts[b'ilst'], keys_ok, out)
 
 
 def bmff_boxes(path):
@@ -582,6 +740,8 @@ def bmff_boxes(path):
 EBML_MAGIC = 0x1A45DFA3
 EBML_SEGMENT = 0x18538067
 EBML_ATTACHMENTS = 0x1941A469
+EBML_TAGS, EBML_TAG, EBML_SIMPLETAG, EBML_TAGNAME, EBML_TAGBINARY = 0x1254C367, 0x7373, 0x67C8, 0x45A3, 0x4485
+MAX_TAG_NAME = 4096
 
 
 def ebml_vint(f, is_id):
@@ -607,6 +767,41 @@ def ebml_element(f, pos):
     ident = ebml_vint(f, True)
     size = ebml_vint(f, False) if ident else None
     return (ident[0], size[0], ident[1] + size[1]) if ident and size else None
+
+
+def ebml_tags(f, pos, end, level, depth, out):
+    """Walk the children of a Tags, Tag or SimpleTag (level) in f[pos:end]; True if a TagName was seen."""
+    named = False
+    while pos < end and len(out) < MAX_BOX_FINDINGS:
+        el = ebml_element(f, pos)
+        if not el:
+            out.append('malformed element inside Matroska Tags at byte %d, so its tags cannot be checked' % pos)
+            return named
+        ident, size, hlen = el
+        if size < 0:
+            out.append('element of unknown size inside Matroska Tags at byte %d: it cannot be checked' % pos)
+            return named
+        stop = pos + hlen + size
+        if stop > end:
+            out.append('element inside Matroska Tags at byte %d runs past its parent, so its tags cannot be checked' % pos)
+            return named
+        if ident == EBML_TAGBINARY:
+            out.append('TagBinary element inside Matroska Tags (binary data cannot be checked)')
+        elif (level, ident) in ((EBML_TAGS, EBML_TAG), (EBML_TAG, EBML_SIMPLETAG), (EBML_SIMPLETAG, EBML_SIMPLETAG)):
+            if depth > 16:
+                out.append('Matroska SimpleTags nested deeper than 16, so they cannot be checked')
+                return named
+            if not ebml_tags(f, pos + hlen, stop, ident, depth + 1, out) and ident == EBML_SIMPLETAG:
+                out.append('Matroska SimpleTag with no TagName')
+        elif level == EBML_SIMPLETAG and ident == EBML_TAGNAME:
+            named = True
+            if size > MAX_TAG_NAME:
+                out.append('Matroska TagName of %d bytes: too long to check' % size)
+            else:
+                f.seek(pos + hlen)
+                out.extend(tag_findings('Matroska', {f.read(size).decode('utf-8', 'replace').strip('\x00 '): 1}))
+        pos = stop
+    return named
 
 
 def ebml_findings(path):
@@ -639,6 +834,8 @@ def ebml_findings(path):
                 out.append('Attachments element at the Segment top level (attached files can carry EXIF and XMP)')
             if pos + el[2] + el[1] > end:
                 return out + ['element at byte %d runs past the Segment, so its elements cannot be checked' % pos]
+            if el[0] == EBML_TAGS:
+                ebml_tags(f, pos + el[2], pos + el[2] + el[1], EBML_TAGS, 0, out)
             pos += el[2] + el[1]
     return out
 
@@ -783,19 +980,29 @@ def main(argv):
     sys.stderr.reconfigure(errors='backslashreplace')
     verbose = False
     paths = []
+    usage = 'usage: check-media-metadata.py [-v] [--] PATH...'
+    if len(argv) == 2 and argv[1] in ('-h', '--help'):      # help only when nothing is to be checked
+        print(__doc__)
+        return 0
+    options = True
     for a in argv[1:]:
-        if a in ('-h', '--help'):
-            print(__doc__)
-            return 0
-        if a in ('-v', '--verbose'):
+        if options and a in ('-v', '--verbose', '-h', '--help') and os.path.lexists(a):
+            # `check-media-metadata.py *` in a directory holding a file named -v
+            # would otherwise take it as the flag and never open it.
+            print('check-media-metadata.py: %s is both an option and a file here; put -- before the paths' % a,
+                  file=sys.stderr)
+            return 2
+        if options and a == '--':
+            options = False
+        elif options and a in ('-v', '--verbose'):
             verbose = True
-        elif a.startswith('-'):
-            print('usage: check-media-metadata.py [-v] PATH...', file=sys.stderr)
+        elif options and a.startswith('-'):
+            print(usage, file=sys.stderr)
             return 2
         else:
             paths.append(a)
     if not paths:
-        print('usage: check-media-metadata.py [-v] PATH...', file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 2
 
     def unreadable(e):

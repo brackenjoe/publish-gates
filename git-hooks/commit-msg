@@ -8,7 +8,9 @@
 # reference puts the commit's title on the public item's timeline. Write
 # "example/upstream PR 1235" instead. Bypass for one commit:
 # git commit --no-verify.
-# The pattern lives in xref.sh, beside this file.
+# The pattern lives in xref.sh, beside this file. The scan is bytewise (grep
+# under LC_ALL=C with -a), so an invalid byte on a line cannot hide a
+# reference from it; a grep status above 1 refuses.
 # This hook is the early catch only: git runs it for `git commit` and
 # `git merge`, not for -n, cherry-pick, rebase picks, commit-tree or am
 # (githooks(5)). The gate is pre-push, which scans the commits being pushed
@@ -49,8 +51,21 @@ if [ -n "$origin" ]; then
     done
     [ "$ours" -eq 1 ] || exit 0
 fi
-msg=$(grep -v '^#' "$1")
+# Bytewise (LC_ALL=C, -a): a UTF-8 locale would drop a line holding an invalid
+# byte before the test. grep -v exits 1 for a message that is all comments
+# (nothing selected); above 1 it failed, and an unknown is not clean.
+msg=$(LC_ALL=C grep -a -v '^#' "$1")
+grc=$?
+if [ "$grc" -gt 1 ]; then
+    echo "commit-msg: refused: grep failed on the message (status $grc); an unknown is not clean" >&2
+    exit 1
+fi
 hit=$(printf '%s\n' "$msg" | xref_grep)
+grc=$?
+if [ "$grc" -gt 1 ]; then
+    echo "commit-msg: refused: grep failed on the message (status $grc); an unknown is not clean" >&2
+    exit 1
+fi
 if [ -n "$hit" ]; then
     echo "commit-msg: GitHub cross-reference in the message; write 'owner/repo PR N' with no '#':" >&2
     printf '%s\n' "$hit" >&2

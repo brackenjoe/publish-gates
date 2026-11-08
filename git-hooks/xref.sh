@@ -34,7 +34,11 @@ xref_is_private() {
 }
 
 # xref_grep: reads a message on stdin, prints the offending lines as N:line;
-# status 0 when there is at least one.
+# status 0 when there is at least one, 1 when there is none, above 1 when grep
+# failed (callers refuse on that). Runs bytewise (LC_ALL=C, -a), as
+# public-scan.sh does: in a UTF-8 locale grep does not print a matching line
+# that holds an invalid byte, so a commit built without `git commit` (which
+# repairs the byte) could hide a reference from the scan.
 xref_grep() {
-    grep -nE -- "$xref_regex"
+    LC_ALL=C grep -a -nE -- "$xref_regex"
 }

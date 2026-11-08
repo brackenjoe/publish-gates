@@ -45,7 +45,11 @@
 #   host          alias for github.com (GATES_SSH stub) judged as GitHub, an
 #                 alias for another host noted and allowed, a trailing dot,
 #                 gist.github.com refused unless approved, a host starting
-#                 with "-" never passed to ssh, a local path silent
+#                 with "-" never passed to ssh, a local path silent; a %XX
+#                 host, a segment after OWNER/REPO and a .wiki repo refused as
+#                 unknown unless approved, an underscore alias passing
+#   locale        an invalid byte on a reference line refused by pre-push (a
+#                 --literally commit) and commit-msg under C.UTF-8
 #   commit-msg    origin example/private-one: owner/repo#12 refused,
 #                 "example/upstream PR 1235" accepted; origin a public fork:
 #                 the same message accepted; no origin: refused;
@@ -439,7 +443,7 @@ ppssh() {
 ppssh "alias for github.com, public: refused, checker called" 1 'o/r is public' git@gh-work:o/r.git public github.com 'o r'
 ppssh "alias for github.com, private: allowed, checker called" 0 '' git@gh-work:o/r.git private GitHub.com. 'o r'
 ppssh "ssh:// alias for github.com, public: refused"          1 'o/r is public' ssh://git@gh-work/o/r.git public github.com 'o r'
-ppssh "alias for another host: allowed with a note"           0 'not checked: host gh-work is not GitHub' git@gh-work:o/r.git public example.net ''
+ppssh "alias for another host: allowed with a note"           0 'not checked: host example.net is not GitHub' git@gh-work:o/r.git public example.net ''
 ppssh "ssh -G prints no hostname: allowed with a note"        0 'not checked: host gh-work is not GitHub' git@gh-work:o/r.git public '' ''
 ppssh "https URL on another host: note, ssh not run"          0 'not checked: host example.com is not GitHub' https://example.com/o/r.git public github.com ''
 if [ ! -s "$SSH_ARGV" ]; then ok "https host is never resolved through ssh"; else bad "https host is never resolved" "ssh argv: $(cat "$SSH_ARGV")"; fi
@@ -452,10 +456,13 @@ ppssh "git@gist.github.com, no approval: refused"             1 'gist' git@gist.
 rc=0
 err=$(STUB_WORD=private STUB_RC=0 GATES_CHECK_VISIBILITY=$STUB GATES_PUBLIC_PUSH_OK=yes "$HOOKS/pre-push" origin https://gist.github.com/abc.git </dev/null 2>&1 >/dev/null) || rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'gist.*approved by GATES_PUBLIC_PUSH_OK'; then ok "gist with GATES_PUBLIC_PUSH_OK=yes: allowed"; else bad "gist with OK=yes" "rc=$rc: $err"; fi
-ppssh "host starting with - (scp-like): not resolved, note"    0 'not checked' 'git@-oProxyCommand=x:o/r.git' public github.com ''
+ppssh "host starting with - (scp-like): not resolved, note"    0 'not checked' 'git@-oproxycommand:o/r.git' public github.com ''
 if [ ! -s "$SSH_ARGV" ]; then ok "host starting with - is never passed to ssh (scp-like)"; else bad "dash host passed to ssh (scp-like)" "$(cat "$SSH_ARGV")"; fi
-ppssh "host starting with - (ssh://): not resolved, note"      0 'not checked' 'ssh://-oProxyCommand=x/o/r.git' public github.com ''
+ppssh "host starting with - (ssh://): not resolved, note"      0 'not checked' 'ssh://-oproxycommand/o/r.git' public github.com ''
 if [ ! -s "$SSH_ARGV" ]; then ok "host starting with - is never passed to ssh (ssh://)"; else bad "dash host passed to ssh (ssh://)" "$(cat "$SSH_ARGV")"; fi
+ppssh "host starting with - and an odd character (scp-like): unknown, refused" 1 'unknown' 'git@-oProxyCommand=x:o/r.git' public github.com ''
+if [ ! -s "$SSH_ARGV" ]; then ok "odd dash host is never passed to ssh"; else bad "odd dash host passed to ssh" "$(cat "$SSH_ARGV")"; fi
+ppssh "host starting with - and an odd character (ssh://): unknown, refused" 1 'unknown' 'ssh://-oProxyCommand=x/o/r.git' public github.com ''
 ppssh "a resolved host is passed after --"                    0 '' git@gh-work:o/r.git private github.com 'o r'
 if [ "$(cat "$SSH_ARGV")" = "-G -- gh-work" ]; then ok "ssh is run as: ssh -G -- HOST"; else bad "ssh argv" "$(cat "$SSH_ARGV")"; fi
 ppssh "local path: no note"                                    0 - /srv/x/repo.git public github.com ''
@@ -474,7 +481,7 @@ if [ "$rc" -ne 0 ] && printf '%s' "$err" | grep -q 'pre-push: refused: o/r is pu
 else bad "git push through an alias for github.com" "rc=$rc: $err"; fi
 rc=0
 err=$(STUB_WORD=public STUB_RC=0 STUB_HOSTNAME=example.net GATES_SSH=$SSHSTUB GATES_CHECK_VISIBILITY=$STUB git -C "$SC" push gh main 2>&1) || rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'not checked: host gh-work' && sc_arrived main; then
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q 'not checked: host example.net' && sc_arrived main; then
   ok "git push through an alias for another host: arrives, with the note"
 else bad "git push through an alias for another host" "rc=$rc: $err"; fi
 
@@ -540,6 +547,81 @@ echo q >"$SC/q"; git -C "$SC" add q
 rc=0
 err=$(git -C "$SC" commit -q -m "plain message" 2>&1) || rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$err" | grep -q 'commit-msg: refused: .*xref.sh'; then ok "xref.sh missing: commit-msg refuses"; else bad "xref.sh missing: commit-msg refuses" "rc=$rc: $err"; fi
+
+# URL judged as git reads it (audit 2026-11-08, prepush-url-judged-not-
+# canonicalised): a %XX host, a segment after OWNER/REPO and a .wiki repo take
+# the unknown path (stub not called, scanned, refused unless approved); the
+# plain forms still reach the checker.
+pp "percent-encoded host (http): refused as unknown"        1 'unknown'        http://%67ithub.com/o/pub private 0 ''
+pp "percent-encoded host (ssh://): refused as unknown"      1 'unknown'        ssh://git@%67ithub.com/o/pub private 0 ''
+pp "percent-encoded host (http) + OK=yes: allowed"          0 'approved'       http://%67ithub.com/o/pub private 0 '' yes
+pp "percent-encoded host (ssh://) + OK=yes: allowed"        0 'approved'       ssh://git@%67ithub.com/o/pub private 0 '' yes
+pp "dot segment after OWNER/REPO: refused as unknown"       1 'unknown'        $GH/o/priv/../pub private 0 ''
+pp "segment after OWNER/REPO: refused as unknown"           1 'unknown'        $GH/o/priv/x private 0 ''
+pp "OWNER/REPO control: private, checker called"            0 ''               $GH/o/priv private 0 'o priv'
+pp "OWNER/REPO.git control: private, checker called"        0 ''               $GH/o/priv.git private 0 'o priv'
+pp "OWNER/REPO/ control: private, checker called"           0 ''               $GH/o/priv/ private 0 'o priv'
+pp "wiki remote (https): refused as unknown"                1 'unknown'        $GH/o/r.wiki.git private 0 ''
+pp "wiki remote (scp): refused as unknown"                  1 'unknown'        git@github.com:o/r.wiki.git private 0 ''
+pp "wiki remote (https) + OK=yes: allowed"                  0 'approved'       $GH/o/r.wiki.git private 0 '' yes
+pp "wiki remote (scp) + OK=yes: allowed"                    0 'approved'       git@github.com:o/r.wiki.git private 0 '' yes
+ppssh "underscore ssh alias resolving to github.com: private, allowed" 0 '' git@gh_work:o/priv.git private github.com 'o priv'
+ppssh "underscore ssh alias, ssh:// form: private, allowed"            0 '' ssh://git@gh_work/o/priv.git private github.com 'o priv'
+
+# review of 57c18ab2 (2026-11-08): the odd-host test runs on the name ssh -G
+# resolves to, repo suffixes are case-insensitive, a % in the path is unknown.
+ppssh "underscore alias resolving to gitlab.com: not checked, allowed" 0 'not checked: host gitlab.com is not GitHub' git@work_gl:me/x.git public gitlab.com ''
+ppssh "underscore alias resolving to github.com: private, allowed"     0 '' git@work_gl:o/priv.git private github.com 'o priv'
+ppssh "underscore alias resolving to github.com, public: refused"      1 'o/priv is public' git@work_gl:o/priv.git public github.com 'o priv'
+ppssh "alias resolving to an odd name: refused, host named"            1 'host a%67b.com holds a character outside' git@work_gl:o/priv.git private 'a%67b.com' ''
+pp "percent-encoded host: stderr names the host"            1 'host %67ithub.com holds a character outside .*treated as unknown' http://%67ithub.com/o/pub private 0 ''
+pp "wiki remote, upper-case WIKI (scp): refused as unknown"  1 'unknown'        git@github.com:o/r.WIKI.git private 0 ''
+pp "wiki remote, upper-case GIT (https): refused as unknown" 1 'unknown'        $GH/o/r.wiki.GIT private 0 ''
+pp "wiki remote, upper-case WIKI + OK=yes: allowed"          0 'approved'       git@github.com:o/r.WIKI.git private 0 '' yes
+pp "upper-case .GIT suffix stripped, name lowercased"        0 ''               $GH/Acme/Widget.GIT private 0 'Acme widget'
+pp "percent in path (%2F): refused as unknown"               1 'unknown'        $GH/o/priv%2F..%2Fpub private 0 ''
+pp "percent in path + OK=yes: allowed"                       0 'approved'       $GH/o/priv%2F..%2Fpub private 0 '' yes
+
+# an invalid byte on the reference line (audit 2026-11-08, xref.sh:grep-runs-
+# in-caller-locale): a commit written with hash-object --literally (commit
+# repairs the byte) is refused by pre-push, and a message file holding it by
+# commit-msg, under a UTF-8 locale
+sc_new $PRIV
+ZERO=0000000000000000000000000000000000000000
+ETREE=$(git -C "$SC" hash-object -t tree -w /dev/null)
+mkcommit() { # mkcommit FORMAT: prints the sha of a parentless commit whose body line is printf FORMAT
+  { printf 'tree %s\nauthor n <a@b.c> 1700000000 +0000\ncommitter n <a@b.c> 1700000000 +0000\n\nsubject\n\n' "$ETREE"
+    # shellcheck disable=SC2059
+    printf "$1"; printf '\n'; } >"$TMP/c.txt"
+  git -C "$SC" hash-object -t commit -w --literally "$TMP/c.txt"
+}
+pplocale() { # pplocale NAME WANT_RC SHA LOCALE: pre-push on a ref line for SHA
+  local name=$1 want=$2 sha=$3 loc=$4 rc=0 err
+  err=$(cd "$SC" && printf 'refs/heads/main %s refs/heads/main %s\n' "$sha" "$ZERO" |
+    LC_ALL=$loc STUB_WORD=private STUB_RC=0 GATES_CHECK_VISIBILITY=$STUB "$HOOKS/pre-push" gh "$PRIV" 2>&1 >/dev/null) || rc=$?
+  if [ "$rc" -ne "$want" ]; then bad "$name" "rc=$rc, want $want: $err"; return; fi
+  if [ "$want" -ne 0 ] && ! printf '%s' "$err" | grep -q 'GitHub cross-reference'; then bad "$name" "refused, but not by the scan: $err"; return; fi
+  ok "$name"
+}
+BADC=$(mkcommit 'see x/y#5 \377 here')
+GOODC=$(mkcommit 'see x/y#5 \303\251 here')
+CLEANC=$(mkcommit 'nothing to see \377 here')
+pplocale "invalid byte on the xref line, C.UTF-8: pre-push refuses" 1 "$BADC" C.UTF-8
+pplocale "invalid byte on the xref line, C: pre-push refuses"       1 "$BADC" C
+pplocale "valid UTF-8 on the xref line, C.UTF-8: refused"            1 "$GOODC" C.UTF-8
+pplocale "invalid byte, no xref, C.UTF-8: allowed"                   0 "$CLEANC" C.UTF-8
+cmlocale() { # cmlocale NAME WANT_RC LOCALE LINE: commit-msg on a message file with LINE (printf format)
+  local name=$1 want=$2 loc=$3 line=$4 rc=0 err
+  # shellcheck disable=SC2059
+  { printf 'subject\n\n'; printf "$line"; printf '\n'; } >"$TMP/m.txt"
+  err=$(cd "$SC" && LC_ALL=$loc "$HOOKS/commit-msg" "$TMP/m.txt" 2>&1) || rc=$?
+  if [ "$rc" -ne "$want" ]; then bad "$name" "rc=$rc, want $want: $err"; return; fi
+  if [ "$want" -ne 0 ] && ! printf '%s' "$err" | grep -q 'commit-msg: GitHub cross-reference'; then bad "$name" "refused, but not by the scan: $err"; return; fi
+  ok "$name"
+}
+cmlocale "invalid byte on the xref line, C.UTF-8: commit-msg refuses" 1 C.UTF-8 'see x/y#5 \377 here'
+cmlocale "invalid byte on the xref line, C: commit-msg refuses"       1 C 'see x/y#5 \377 here'
+cmlocale "invalid byte, no xref, C.UTF-8: commit-msg accepts"         0 C.UTF-8 'nothing \377 here'
 
 echo "$pass passed, $failn failed"
 [ "$failn" -eq 0 ]

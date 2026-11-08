@@ -11,7 +11,9 @@
 #   scan.sh --deps [VENV_DIR...]        pip-audit the venvs (needs network)
 #
 # Exit 0 clean, 1 findings, 2 usage or setup error (a tool or config missing,
-# or under --deps any venv skipped).
+# a scanner that started and left no exit status, or a bandit run that did
+# not analyse every selected .py; under --deps any venv skipped; a selected
+# path whose name holds a newline or carriage return).
 #
 # --staged and --all are offline. They scan the INDEX content, not the working
 # tree, so a partly staged file is judged as it will be committed, and nothing
@@ -23,7 +25,14 @@
 #   Python: *.py, or no extension and a shebang naming python.
 #   Shell:  *.sh, or no extension and a shebang ending in sh, bash or dash.
 #   ruff        --isolated, only E9,F63,F7,F82 (syntax errors, undefined names)
-#   bandit      medium and higher severity and confidence
+#   bandit      medium and higher severity and confidence. Run with -f json and
+#               an exclude that matches nothing (bandit's default exclude list
+#               would otherwise drop explicitly named files under .github/,
+#               .githooks/, .gitlab/ and the like). The JSON is turned into
+#               PATH:LINE: CODE [SEVERITY] message lines. It is a tool error
+#               (exit 2), not a clean run, if the JSON does not parse, bandit
+#               reports any entry in "errors" (a file it could not parse or
+#               analyse), or a selected .py is missing from its "metrics".
 #   Shell lint  shellcheck --norc, warning and higher
 #   gitleaks    every staged (--staged) or selected (--all) file, not only py
 #               and sh; always the config beside the binary and --redact (a
@@ -69,7 +78,9 @@
 # beside the scanner), else ours. pip, setuptools and wheel findings are
 # "venv tooling": printed, but do not make the exit 1. A venv whose audit
 # fails (no network, pip-audit error, unparsable output), has no bin/python, or
-# is tracked in git is skipped, not a finding. A venv with tracked files is
+# is tracked in git is skipped, not a finding. pip-audit runs from an empty
+# temporary directory with PYTHONSAFEPATH=1, so a pip/ or pip.py in the current
+# directory cannot shadow pip. A venv with tracked files is
 # never executed (its bin/python would run), unless named as a VENV_DIR argument,
 # which is trusted. A pyvenv.cfg that is not a regular file is not a venv.
 # A package pip-audit could not resolve (skip_reason) is reported per venv as
@@ -131,6 +142,8 @@ fi
 if [ "$mode" = deps ]; then
   PIP_AUDIT=${GATES_PIP_AUDIT:-$SCAN_VENV/bin/pip-audit}
   [ -x "$PIP_AUDIT" ] || die "setup: pip-audit not found at $PIP_AUDIT; rebuild the scanner venv: $REBUILD"
+  # Absolute: pip-audit runs from another directory below.
+  case $PIP_AUDIT in /*) ;; *) PIP_AUDIT=$(cd "$(dirname "$PIP_AUDIT")" && pwd -P)/$(basename "$PIP_AUDIT") ;; esac
   command -v python3 >/dev/null || die "setup: python3 not found on PATH"
   venvs=()
   explicit=0
@@ -181,11 +194,13 @@ sys.exit(10 if real else 0)
   # venv_tracked ABS: 0 untracked, 1 tracked, 2 git could not tell (the caller
   # treats it as tracked). Asks the outer repo, then the repository that holds
   # the venv itself (a nested checkout or submodule the outer index cannot
-  # see). Any nonzero exit or stderr from git is "could not tell".
+  # see). Any nonzero exit or stderr from git is "could not tell". The trees
+  # are not ours, so every call turns core.fsmonitor off: a copied .git/config
+  # could otherwise name a command for git to run.
   venv_tracked() {
     local abs=$1 gerr top out rc
     gerr=$(mktemp) || return 2
-    gq() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR LC_ALL=C git "$@" 2>"$gerr"; }
+    gq() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR LC_ALL=C git -c core.fsmonitor=false "$@" 2>"$gerr"; }
     out=$(gq -C "$SEARCH" ls-files -- ":(literal)$abs"); rc=$?
     if [ $rc -ne 0 ] || [ -s "$gerr" ]; then rm -f "$gerr"; return 2; fi
     if [ -n "$out" ]; then rm -f "$gerr"; return 1; fi
@@ -201,6 +216,8 @@ sys.exit(10 if real else 0)
     [ -n "$out" ] && return 1
     return 0
   }
+  AUDCWD=$(mktemp -d) || die "mktemp failed"
+  trap 'rm -rf "$AUDCWD"' EXIT
   nfind=0; nskip=0; naud=0
   for v in "${venvs[@]}"; do
     v=${v%/}
@@ -228,7 +245,7 @@ sys.exit(10 if real else 0)
       echo "$rel: skipped (no bin/python)"; nskip=$((nskip + 1)); continue
     fi
     errf=$(mktemp) || die "mktemp failed"
-    json=$(PIPAPI_PYTHON_LOCATION="$abs/bin/python" timeout 180 "$PIP_AUDIT" --progress-spinner off -f json 2>"$errf")
+    json=$(cd "$AUDCWD" && PYTHONSAFEPATH=1 PIPAPI_PYTHON_LOCATION="$abs/bin/python" timeout 180 "$PIP_AUDIT" --progress-spinner off -f json 2>"$errf")
     rc=$?
     out=$(printf '%s' "$json" | python3 -I -c "$parser" "$label" "$rel" 2>/dev/null)
     prc=$?
@@ -305,6 +322,14 @@ if [ "$mode" = staged ]; then
 else
   while IFS= read -r -d '' p; do all+=("$p"); done < <(git ls-files -z)
 fi
+
+# The baseline key and the finding lines are newline-delimited; a path with a
+# newline or CR could forge a key, so refuse it outright.
+for p in "${all[@]}"; do
+  case $p in
+  *$'\n'* | *$'\r'*) die "path contains a newline or carriage return: $(printf '%q' "$p")" ;;
+  esac
+done
 
 files=()
 for p in "${all[@]}"; do
@@ -425,11 +450,15 @@ done
 # exit status to NAME.rc. They run in parallel.
 run() { # name, command...
   local n=$1; shift
+  : >"$TMP/$n.started"
   ( cd "$W" && "$@" >"$TMP/$n.out" 2>"$TMP/$n.err"; echo $? >"$TMP/$n.rc" ) &
 }
 if [ ${#py[@]} -gt 0 ]; then
   run ruff "$RUFF" check --isolated --no-cache --select E9,F63,F7,F82 --output-format concise -- "${py[@]}"
-  run bandit "$BANDIT" -q -ll -ii -f custom --msg-template '{relpath}:{line}: {test_id} [{severity}] {msg}' -- "${py[@]}"
+  # -x with a path that matches nothing: the default exclude list otherwise
+  # drops explicitly named files (.github/, .githooks/, ...), silently.
+  run bandit "$BANDIT" -q -ll -ii -f json -x /nonexistent/scan-sh-no-exclude -- "${py[@]}"
+  printf '%s\0' "${py[@]}" >"$TMP/py.list"
 fi
 if [ ${#sh[@]} -gt 0 ]; then
   run shellcheck shellcheck --norc -S warning -f gcc -- "${sh[@]}"
@@ -445,6 +474,35 @@ fi
 run gitleaks "$GITLEAKS" dir "$GLDIR" --redact --no-banner --no-color --config "$GL_CONFIG" --gitleaks-ignore-path "$TMP/no-gitleaksignore" -f json -r -
 wait
 
+# Bandit JSON to finding lines on stdout. argv[1] is the NUL-separated list of
+# the .py paths that were selected. Exit 3 (nothing trusted) if the JSON does
+# not parse, "errors" is non-empty, or a selected path is missing from
+# "metrics" (an analysed file always has an entry, even a clean one).
+bandit_parse='
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+    errs = d["errors"]
+    metrics = d["metrics"]
+    results = d["results"]
+    want = [p for p in open(sys.argv[1], "rb").read().decode("utf-8", "surrogateescape").split("\0") if p]
+    seen = {os.path.normpath(k) for k in metrics if k != "_totals"}
+    problems = ["%s: %s" % (e.get("filename"), e.get("reason")) for e in errs]
+    problems += ["%s: not analysed" % p for p in want if os.path.normpath(p) not in seen]
+    if problems:
+        for x in problems:
+            sys.stderr.write(x + "\n")
+        sys.exit(3)
+    for r in results:
+        msg = " ".join(str(r["issue_text"]).split())
+        print("%s:%s: %s [%s] %s" % (os.path.normpath(r["filename"]), r["line_number"], r["test_id"], r["issue_severity"], msg))
+except SystemExit:
+    raise
+except Exception as e:
+    sys.stderr.write("unusable bandit output: %r\n" % (e,))
+    sys.exit(3)
+'
+
 total=0; toolerr=0; known=0
 declare -A cnt=([ruff]=0 [bandit]=0 [shellcheck]=0 [gitleaks]=0)
 re_ruff='^(.+):[0-9]+:[0-9]+: ([^ :]+)'
@@ -452,11 +510,25 @@ re_bandit='^(.+):[0-9]+: (B[0-9]+) '
 re_sc='^(.+):[0-9]+:[0-9]+: .*\[(SC[0-9]+)\]$'
 re_gl='^(.+):[0-9]+: (.+)$'
 for n in ruff bandit shellcheck gitleaks; do
-  [ -f "$TMP/$n.rc" ] || continue
+  if [ ! -f "$TMP/$n.rc" ]; then
+    if [ -f "$TMP/$n.started" ]; then
+      echo "== $n: tool error (started, no exit status: killed?) ==" >&2
+      cat "$TMP/$n.out" "$TMP/$n.err" 2>/dev/null >&2
+      toolerr=1
+    fi
+    continue
+  fi
   rc=$(cat "$TMP/$n.rc")
   case $n in
   ruff | shellcheck) lines=$(grep -E '^.+:[0-9]+:[0-9]+: ' "$TMP/$n.out") ;;
-  bandit) lines=$(grep -E '^.+:[0-9]+: B[0-9]+ ' "$TMP/$n.out") ;;
+  bandit)
+    if ! lines=$(python3 -I -c "$bandit_parse" "$TMP/py.list" <"$TMP/$n.out" 2>"$TMP/bandit.perr"); then
+      echo "== bandit: tool error (exit $rc; output not trusted) ==" >&2
+      cat "$TMP/bandit.perr" "$TMP/$n.err" >&2
+      toolerr=1
+      continue
+    fi
+    ;;
   gitleaks)
     lines=$(python3 -I -c "$gl_parse" "$GLDIR" "$TMP/gl.alias" <"$TMP/$n.out" 2>/dev/null)
     ;;

@@ -37,7 +37,13 @@
 #   gitleaks    every staged (--staged) or selected (--all) file, not only py
 #               and sh; always the config beside the binary and --redact (a
 #               .gitleaks.toml in the scanned tree would otherwise replace the
-#               rules). It runs "gitleaks dir" over a separate tree, $TMP/gl,
+#               rules). The config's global path allowlist (the paths key of
+#               [allowlist] and of any top-level [[allowlists]]: node_modules,
+#               lockfiles, images, vendor/ and the like) is dropped from a temp
+#               copy, so every selected file is read; [[rules.allowlists]] and
+#               the other global keys stay. The copy is checked with tomllib; if
+#               that fails, or the config cannot be read, it is exit 2. It runs
+#               "gitleaks dir" over a separate tree, $TMP/gl,
 #               holding the RAW blob of each path, read with git cat-file from
 #               the index. No .gitattributes filter, working-tree-encoding or
 #               -diff attribute applies, so none can hide content from it.
@@ -411,6 +417,171 @@ with tempfile.TemporaryFile() as req, tempfile.TemporaryFile() as resp:
         with open(out, "wb") as fh:
             fh.write(data)
 '
+# Writes a copy of the gitleaks config ($1 to $2) without the paths key of the
+# global allowlist: [allowlist] and every top-level [[allowlists]] table. The
+# release config skips node_modules, lockfiles, images and the like by path,
+# so a token staged there would never be read. [[rules.allowlists]] and every
+# other key (regexes, stopwords, commits) stay. A line-based edit that follows
+# the table headers and skips strings, arrays and comments; tomllib then parses
+# the result and checks no top-level allowlist still has paths. Any failure
+# (no tomllib, unreadable or unparsable config) is a non-zero exit.
+gl_cfg='
+import re, sys, tomllib
+
+DQ = chr(34)
+QUOTES = chr(34) + chr(39)
+src = open(sys.argv[1], "rb").read().decode("utf-8")
+n = len(src)
+
+
+def skip_str(i):
+    # i is at a quote character; returns the index after the string.
+    q = src[i]
+    if src.startswith(q * 3, i):
+        j = i + 3
+        while j < n:
+            if q == DQ and src[j] == "\\":
+                j += 2
+                continue
+            if src.startswith(q * 3, j):
+                j += 3
+                while j < n and src[j] == q:
+                    j += 1
+                return j
+            j += 1
+        raise ValueError("unterminated string")
+    j = i + 1
+    while j < n:
+        c = src[j]
+        if c == "\n":
+            raise ValueError("unterminated string")
+        if q == DQ and c == "\\":
+            j += 2
+            continue
+        if c == q:
+            return j + 1
+        j += 1
+    raise ValueError("unterminated string")
+
+
+def skip_value(i):
+    # i is at the first character of a value; returns the index after it.
+    if src[i] in QUOTES:
+        return skip_str(i)
+    if src[i] not in "[{":
+        while i < n and src[i] not in "\n#":
+            i += 1
+        return i
+    depth = 0
+    while i < n:
+        c = src[i]
+        if c in QUOTES:
+            i = skip_str(i)
+            continue
+        if c == "#":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if c in "[{":
+            depth += 1
+        elif c in "]}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError("unterminated array")
+
+
+def eol(i):
+    while i < n and src[i] != "\n":
+        i += 1
+    return i
+
+
+cuts = []
+recs = []
+rec = None
+table = ""
+i = 0
+while i < n:
+    while i < n and src[i] in " \t\r":
+        i += 1
+    if i >= n:
+        break
+    c = src[i]
+    if c == "\n":
+        i += 1
+    elif c == "#":
+        i = eol(i)
+    elif c == "[":
+        e = eol(i)
+        m = re.match(r"(\[\[?)\s*([^\]]*?)\s*\]\]?\s*(#.*)?$", src[i:e].rstrip())
+        if not m:
+            raise ValueError("unreadable table header")
+        name = re.sub(r"\s+", "", m.group(2)).lower()
+        table = name + ("[]" if m.group(1) == "[[" else "")
+        if rec is not None:
+            rec["he"] = i
+        rec = None
+        if table in ("allowlist", "allowlists[]"):
+            rec = {"hs": i, "he": n, "checks": False, "and": False, "paths": False}
+            recs.append(rec)
+        i = e
+    else:
+        k0 = i
+        while i < n and src[i] != "=" and src[i] != "\n":
+            i += 1
+        if i >= n or src[i] != "=":
+            raise ValueError("unreadable key")
+        key = src[k0:i].strip().strip(QUOTES).lower()
+        i += 1
+        while i < n and src[i] in " \t":
+            i += 1
+        if i >= n or src[i] == "\n":
+            raise ValueError("missing value")
+        v1 = skip_value(i)
+        e = eol(v1)
+        if rec is not None and key in ("commits", "regexes", "stopwords"):
+            # only a non-empty array counts as a check
+            if len(tomllib.loads("x = " + src[i:v1]).get("x") or []) > 0:
+                rec["checks"] = True
+        if rec is not None and key == "condition":
+            rec["and"] = src[i:v1].strip().strip(QUOTES).lower() == "and"
+        if rec is not None and key == "paths":
+            rec["paths"] = True
+            cuts.append((k0, e))
+        i = e
+
+# gitleaks refuses an allowlist table with no check left, so one that held
+# only paths is dropped whole. An AND table with paths is dropped whole too:
+# without paths, "path AND regex" would become "regex anywhere".
+for r in recs:
+    if (r["and"] and r["paths"]) or not r["checks"]:
+        cuts = [c for c in cuts if not r["hs"] <= c[0] < r["he"]]
+        cuts.append((r["hs"], r["he"]))
+cuts.sort()
+out = src
+for a, b in reversed(cuts):
+    out = out[:a] + out[b:]
+
+cfg = tomllib.loads(out)
+tops = []
+for k, v in cfg.items():
+    k = k.lower()
+    if k == "extend":
+        raise ValueError("an [extend] would pull the base config allowlist back in")
+    if k == "allowlist" or k == "allowlists":
+        if k == "allowlist" and isinstance(v, dict):
+            tops.append(v)
+        elif k == "allowlists" and isinstance(v, list):
+            tops.extend(t for t in v if isinstance(t, dict))
+        else:
+            raise ValueError("unexpected allowlist form")
+for t in tops:
+    if any(k.lower() == "paths" for k in t):
+        raise ValueError("a global paths key remains")
+open(sys.argv[2], "w", encoding="utf-8").write(out)
+'
 # Turns the gitleaks JSON into "path:line: rule" lines: strips the tree prefix
 # as a plain string (no pattern) and maps the alias back to .gitleaksignore.
 gl_parse='
@@ -471,7 +642,9 @@ if [ "$mode" = staged ]; then glpaths=("${all[@]}"); else glpaths=("${files[@]}"
 if [ ${#glpaths[@]} -gt 0 ]; then
   printf '%s\0' "${glpaths[@]}" | python3 -I -c "$gl_fill" "$GLDIR" "$TMP/gl.alias" || die "could not read the index blobs for gitleaks"
 fi
-run gitleaks "$GITLEAKS" dir "$GLDIR" --redact --no-banner --no-color --config "$GL_CONFIG" --gitleaks-ignore-path "$TMP/no-gitleaksignore" -f json -r -
+python3 -I -c "$gl_cfg" "$GL_CONFIG" "$TMP/gl.toml" >/dev/null 2>"$TMP/gl.cerr" ||
+  die "setup: cannot make the gitleaks config without its global path allowlist from $GL_CONFIG (needs python 3.11+ tomllib; an [extend] table is refused): $(tail -n 1 "$TMP/gl.cerr")"
+run gitleaks "$GITLEAKS" dir "$GLDIR" --redact --no-banner --no-color --config "$TMP/gl.toml" --gitleaks-ignore-path "$TMP/no-gitleaksignore" -f json -r -
 wait
 
 # Bandit JSON to finding lines on stdout. argv[1] is the NUL-separated list of

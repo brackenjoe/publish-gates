@@ -48,16 +48,27 @@
 # a page renders as a plain address. The password pattern is case-insensitive and
 # takes a quoted key and value, so a JSON field and an upper-case shell
 # variable are caught as well as a plain assignment. Its one exemption is the
-# sudoers keyword NOPASSWD (upper case, exactly): `NOPASSWD: ALIAS` passes,
-# `nopassword=x`, `NOPASSWORD=x` and `NoPasswd: x` do not.
+# sudoers keyword NOPASSWD (upper case, exactly, at the start of a word):
+# `NOPASSWD: ALIAS` passes; `nopassword=x`, `NOPASSWORD=x`, `NoPasswd: x`,
+# `NOpasswd=x`, `xNOPASSWD=x` and `CASENOpasswd=x` do not.
+# A phone number is NNN-NNN-NNNN (separator - . or space) or (NNN) NNN-NNNN.
+# An IPv4 address is not read inside a longer digit run or a longer dotted
+# number (five dotted groups), nor after a letter (a package version such as
+# 0ubuntu0.24.04.2 or v1.2.3.4), but is read after an underscore and before a
+# letter or underscore. A MAC address is six octets with one separator (: or -)
+# or the dotted xxxx.xxxx.xxxx form, which needs at least one letter a-f (so a
+# date or a number in groups of four digits passes); all-zero and all-ff pass
+# in each. IPv6 is global (2 or 3 first) or ULA (fd), also compressed with one
+# group after the double colon, except directly after a word character, ] or )
+# followed by [ (a slice such as name[N::M]); 2001:db8: passes.
 # Token shapes beyond the vendor-prefixed ones: OpenAI-style, Google API, npm and
 # GitLab keys, an Authorization Bearer value, and an assigned API key (a value
 # that starts with $, <, { or % is a placeholder and passes).
 # A Cloudflare Artifacts git token (art_v<N>_ and 20 or more token characters;
 # the bare prefix in prose passes) and a password in a URL of any scheme
 # (scheme://user:<secret>@host, user may be empty; a password that starts with
-# $, <, {, a backslash or *, or is the format directive %s, is a placeholder and
-# passes. The password ends at white space, / ? # @ and a quote or angle bracket,
+# $, <, {, a backslash or *, is a placeholder and passes; a password is four
+# or more characters, so the two-character directive %s is not one. The password ends at white space, / ? # @ and a quote or angle bracket,
 # so a port followed by a query string, or by markup and an @, is not read as
 # one; a percent-encoded password (%40...) is a real one.)
 #
@@ -116,10 +127,10 @@ printf x | grep -qP 'x' 2>/dev/null || { echo "$0: needs GNU grep with PCRE supp
 # label|regex, one per line; label|P|regex for a Perl regex (grep -P).
 # Loopback 127.0.0.1 and the wildcard 0.0.0.0 identify nothing and pass.
 patterns='
-IPv4 address|P|\b(?!127[.]0[.]0[.]1\b|0[.]0[.]0[.]0\b)([0-9]{1,3}(?:\\?\.|&#0*46;|&#[xX]0*2[eE];|&period;)){3}[0-9]{1,3}\b
+IPv4 address|P|(?<![A-Za-z0-9])(?<![0-9]\.)(?<![0-9]\\\.)(?!127[.]0[.]0[.]1(?![0-9])|0[.]0[.]0[.]0(?![0-9]))([0-9]{1,3}(?:\\?\.|&#0*46;|&#[xX]0*2[eE];|&period;)){3}[0-9]{1,3}(?![0-9]|(?:\\?\.|&#0*46;|&#[xX]0*2[eE];|&period;)[0-9])
 Tailscale MagicDNS name|[a-z0-9-]+\.ts\.net
 email address|[A-Za-z0-9._%+-]+(\\?@|&#0*64;|&#[xX]0*40;|&commat;)([A-Za-z0-9-]|\\?\.|&#0*46;|&#[xX]0*2[eE];|&period;)+(\\?\.|&#0*46;|&#[xX]0*2[eE];|&period;)[A-Za-z]{2,}
-US phone number|\b[0-9]{3}[-. ][0-9]{3}[-. ][0-9]{4}\b
+US phone number|\b[0-9]{3}[-. ][0-9]{3}[-. ][0-9]{4}\b|\([0-9]{3}\) ?[0-9]{3}[-. ][0-9]{4}\b
 GitHub token|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}
 Anthropic key|sk-ant-[A-Za-z0-9_-]{10,}
 OpenAI-style key|P|\bsk-(?!ant-)(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}
@@ -133,12 +144,12 @@ Slack token|xox[abpr]-[A-Za-z0-9-]{10,}
 Tailscale auth key|tskey-[a-z]+-[A-Za-z0-9-]{10,}
 private key block|BEGIN [A-Z ]*PRIVATE KEY
 WiFi PSK|psk[=]
-assigned password|P|(?i)((?<!(?-i:NO))passwd|password|secret)["\x27]?\s*[:=]\s*["\x27]?[^\s"\x27]{4,}
+assigned password|P|(?i)((?:(?<!(?<![A-Za-z0-9_])(?-i:NO))|(?!(?-i:PASSWD)))passwd|password|secret)["\x27]?\s*[:=]\s*["\x27]?[^\s"\x27]{4,}
 Cloudflare tunnel credentials|Tunnel[S]ecret|Account[T]ag
 Cloudflare Artifacts token|P|(?<![A-Za-z0-9])art_v[0-9]+_[A-Za-z0-9_-]{20,}
-credentials in URL|P|[A-Za-z][A-Za-z0-9+.-]*://[^\s/?#@:]*:(?![$<{\\*]|%s)[^\s/?#@"\x27<>]{4,}@
-IPv6 address|P|(?i)(?<![0-9a-f:])(?!2001:0*db8:)(?:[23][0-9a-f]{3}|fd[0-9a-f]{2})(?::{1,2}[0-9a-f]{1,4}){2,}(?![0-9a-f])
-MAC address|P|(?i)(?<![0-9a-f])(?!00(?::00){5}(?![0-9a-f]))(?!ff(?::ff){5}(?![0-9a-f]))(?:[0-9a-f]{2}:){5}[0-9a-f]{2}(?![0-9a-f])
+credentials in URL|P|[A-Za-z][A-Za-z0-9+.-]*://[^\s/?#@:]*:(?![$<{\\*])[^\s/?#@"\x27<>]{4,}@
+IPv6 address|P|(?i)(?<![0-9a-f:])(?!2001:0*db8:)(?:(?:[23][0-9a-f]{3}|fd[0-9a-f]{2})(?::{1,2}[0-9a-f]{1,4}){2,}|(?<![\w\])]\[)(?:[23][0-9a-f]{3}|fd[0-9a-f]{2})::[0-9a-f]{1,4})(?![0-9a-f])
+MAC address|P|(?i)(?<![0-9a-f])(?:(?!00([:-])00(?:\g{1}00){4}(?![0-9a-f]))(?!ff([:-])ff(?:\g{2}ff){4}(?![0-9a-f]))[0-9a-f]{2}([:-])(?:[0-9a-f]{2}\3){4}[0-9a-f]{2}|(?=[0-9a-f.]{0,13}[a-f])(?!0000[.]0000[.]0000(?![0-9a-f]))(?!ffff[.]ffff[.]ffff(?![0-9a-f]))[0-9a-f]{4}(?:[.][0-9a-f]{4}){2})(?![0-9a-f])
 '
 
 # Paths are named on stderr as they are, except that a name holding a newline

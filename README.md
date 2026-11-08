@@ -14,13 +14,24 @@ bypassed by someone who means to.
 
 | gate | runs | what it stops |
 |---|---|---|
-| `scan.sh` | by hand, or from `git-hooks/pre-commit` on every commit | syntax errors and undefined names (ruff), insecure Python patterns (bandit), shell mistakes (shellcheck) and secret shapes (gitleaks) in the files being committed |
+| `scan.sh` | by hand, or from `git-hooks/pre-commit` on `git commit` | syntax errors and undefined names (ruff), insecure Python patterns (bandit), shell mistakes (shellcheck) and secret shapes (gitleaks) in the files being committed |
 | `git-hooks/pre-commit` | on `git commit`, in repos that opt in with `gates.scan true` | a commit that `scan.sh --staged` finds something in |
 | `git-hooks/commit-msg` | on `git commit` in a private repo | a message holding `owner/repo#N`, `owner/repo@sha` or a github.com issue, pull, commit or discussions URL: GitHub posts the commit's title on that public item's timeline, which leaks a private repo's history one line at a time |
 | `git-hooks/pre-push` | on every `git push` to github.com | the same cross-references in any commit being pushed, unless the target repo is known public (the gate behind `commit-msg`, which git skips for `-n`, cherry-pick, rebase and `am`); and any push to a GitHub repo that is not known private, unless `GATES_PUBLIC_PUSH_OK=yes` is on the command |
 | `public-scan.sh DIR` | by hand, before a directory goes public | IPv4, IPv6 and MAC addresses, Tailscale names, email addresses, phone numbers, token and key shapes of a dozen vendors, private key blocks, passwords in assignments and URLs, and your own list of private terms |
 | `check-media-metadata.py PATH...` | by hand, before photos or video go public | location and device metadata: every image and video is read by its bytes against a per-format allow-list of segments, chunks, boxes and tags, and what is not on the list is refused, the tag named and never its value |
 | `check-visibility.sh OWNER REPO` | from `pre-push`, or by hand | prints `public`, `private` or `ask`; an answer it cannot settle is `ask`, not `private` (a 404, which is also what a misspelt name gets, is `private`: see below) |
+
+No gate scans the file content of past commits. `public-scan.sh` reads the
+files in the working tree, and `pre-push` reads the messages of the commits
+being pushed, not their files. git does not run `pre-commit` for a merge,
+cherry-pick, revert or rebase that completes on its own, or for `git am`, so
+content that arrives that way is not scanned when it is committed. A secret
+removed in a later commit, or deleted in the working tree but not yet
+committed, still goes out with the push. Before a private repository's
+history goes public, scan the history itself, for example with `gitleaks
+git`, using a config without the global path allowlist (see `scan.sh`
+below) so vendored and lock files are read too.
 
 ## Setup
 
@@ -109,7 +120,7 @@ extensionless file whose shebang ends in sh, bash or dash.
 | ruff | `--isolated`, only E9, F63, F7, F82: syntax errors and undefined names |
 | bandit | medium and higher severity and confidence, over every selected Python file: its default excludes (`.git` anywhere in a path, so `.github/` and `.githooks/`, `.tox`, `__pycache__` and the like) are switched off, and a file it errors on or leaves out of its report is a tool error. bandit parses with the scanner venv's Python, so a file using newer syntax than that Python (or Python 2) cannot pass: rebuild the venv on a newer Python, or list the file in `scan.exclude` |
 | shellcheck | `--norc`, warning and higher |
-| gitleaks | every selected file, not only Python and shell, read as the raw blob in the index, so no `.gitattributes` (`-diff`, `binary`, an encoding) can hide one; whole files, so a secret already in a file you modify is reported too; `--redact`, so a found secret is never printed. Under `--staged`, `scan.exclude` does not apply to it, so a commit made only of excluded files, or only of type changes, still gets the secret scan |
+| gitleaks | every selected file, not only Python and shell, read as the raw blob in the index, so no `.gitattributes` (`-diff`, `binary`, an encoding) can hide one; whole files, so a secret already in a file you modify is reported too; `--redact`, so a found secret is never printed. The config's global path allowlist (the release config skips `node_modules/`, some `vendor/` trees, lock files and image-named files) is dropped from a temporary copy, so those files are read too, and a secret in a dependency tree you commit is reported; the content allowlists and each rule's own allowlists stay, and a config with an `[extend]` table is refused (exit 2), since it would bring a base allowlist back. Under `--staged`, `scan.exclude` does not apply to it, so a commit made only of excluded files, or only of type changes, still gets the secret scan |
 
 Every linter ignores config files in the scanned tree (`pyproject.toml`,
 `ruff.toml`, `.shellcheckrc`, `.bandit`, `.gitleaks.toml`, `.gitleaksignore`).
@@ -246,19 +257,22 @@ line is dropped for its encoding. git runs with `core.fsmonitor=false`, so a
 extracted tree) is not run. It does not replace reading the diff; it catches what reading
 misses.
 
-Patterns: IPv4 addresses (`127.0.0.1` and `0.0.0.0` exactly pass), global and ULA IPv6
-(`2001:db8:` passes), MAC addresses, `*.ts.net` names, email addresses,
-US phone numbers, GitHub, Anthropic, OpenAI-style, Google API, npm, GitLab,
+Patterns: IPv4 addresses, also after an underscore (`127.0.0.1`
+and `0.0.0.0` exactly pass), global and ULA IPv6, compressed forms with at least one group after `::`
+included (`2001:db8:` passes), MAC addresses with colons or dashes, or in dotted groups of four that
+hold a letter, `*.ts.net` names, email addresses, US phone numbers with or without
+the area code in parentheses, GitHub, Anthropic, OpenAI-style, Google API, npm, GitLab,
 AWS, Slack and Tailscale token shapes, `Bearer` header values, assigned API
 keys, private key blocks, WiFi pre-shared keys, assigned passwords, Cloudflare tunnel
 credentials and Artifacts tokens, and a password in a URL of any scheme. An
 email or IPv4 address written with Markdown backslash escapes or HTML
 character references, which a page renders as a plain address, is caught
 too. Placeholders: an API-key value that starts with `$`, `<`, `{` or `%`
-passes, and a URL password that starts with `$`, `<`, `{`, `\` or `*` or is
-`%s`; an assigned password has no placeholder form, except that sudoers'
-`NOPASSWD` (upper case, exactly) is not read as one. Hostnames and
-home-directory paths pass on purpose.
+passes, and a URL password that starts with `$`, `<`, `{`, `\` or `*` (a
+URL password under four characters, `%s` among them, is not read); an assigned password has no placeholder form, except that sudoers'
+`NOPASSWD` (upper case, exactly, as a whole word) is not read as one. Hostnames and
+home-directory paths pass on purpose. The patterns are shapes, not a complete
+list: a secret in a form none of them describes passes.
 
 Your own terms: `public-scan.deny` beside the script, one term per line,
 `#` comments, matched as a whole word and case-insensitively (ASCII only);

@@ -36,6 +36,13 @@
 #                  a colon extending an IPv6 or MAC address on either side
 #   audit 11-08    escaped . and @ forms next to an allowed string (exit 1), an
 #                  escaped allow string, core.fsmonitor in DIR not run
+#   audit run 3    NOPASSWD only as the exact upper-case token at a word start,
+#                  bracketed phone numbers, MAC with dashes or dots (and the
+#                  exemptions per form), a URL password starting %s, short
+#                  compressed IPv6, IPv4 beside a letter or underscore
+#   audit run 3    follow-up: IPv4 after a letter (versions) not a hit, the
+#                  slice name[N::M] not an IPv6 hit, dotted MAC needs a letter
+#                  a-f, a URL password %s exempt by length only
 #   deny list      PUBLIC_SCAN_DENY missing or unreadable (exit 2), a CRLF term,
 #                  a trailing-space term, comments and blanks, the term count
 #
@@ -356,6 +363,70 @@ run "$W/dc" "PUBLIC_SCAN_DENY=$W/deny.none"; expect_not "a deny file with no ter
 run "$W/dn" "PUBLIC_SCAN_DENY=$W/deny.none" "PUBLIC_SCAN_TERMS=zebrafoo"; expect "PUBLIC_SCAN_TERMS alone matches: exit 1" 1 '^FAIL  deny-list term'
 printf 'zebrafoo\n' > "$W/allow3"
 run "$W/dn" "PUBLIC_SCAN_DENY=$W/deny.ok" "PUBLIC_SCAN_ALLOW=$W/allow3"; expect "allowed deny term passes: exit 0" 0 '1 deny terms'
+
+# ---- audit 2026-11-08 run 3, findings 2-4 and the three folded forms
+# rule NAME TEXT RC REGEX: TEXT alone in a file; the scan exits RC and matches REGEX.
+RN=0
+rule() {
+  RN=$((RN + 1)); mk "rl$RN"; printf '%s\n' "$2" > "$W/rl$RN/a.txt"
+  run "$W/rl$RN"; expect "$1" "$3" "$4"
+}
+PW="pass""wd"; PWL="NO""$PW"; PWU="NOPASS""WD"; V="=abcd"
+rule "NOPASSWD, exact: exempt" "$PWU: ALL" 0 '^ok    no public-scan hits'
+rule "NOPASSWD, in a sudoers line: exempt" "%wheel ALL=(ALL) $PWU: ALL" 0 '^ok    no public-scan hits'
+rule "NO + lower-case passwd with a value: hit" "$PWL$V" 1 '^FAIL  assigned password'
+rule "NOPasswd with a value: hit" "NOPass""wd: abcd" 1 '^FAIL  assigned password'
+rule "NOpAsSwD with a value: hit" "NOpAs""SwD$V" 1 '^FAIL  assigned password'
+rule "x before NOPASSWD: hit" "x$PWU$V" 1 '^FAIL  assigned password'
+rule "CASENO + passwd: hit" "CASE$PWL$V" 1 '^FAIL  assigned password'
+PH="(555) 010""-0199"
+rule "phone with area code in brackets: hit" "call $PH now" 1 '^FAIL  US phone number'
+rule "phone, brackets and a space: hit" "call (555) 010 0""199 now" 1 '^FAIL  US phone number'
+rule "(555) with a short number: exempt" "call (555) 01-0199 now" 0 '^ok    no public-scan hits'
+M6="0a"":1b:2c"":3d:4e"":5f"
+rule "MAC, colons: hit" "dev $M6 end" 1 '^FAIL  MAC address'
+rule "MAC, dashes: hit" "dev ${M6//:/-} end" 1 '^FAIL  MAC address'
+rule "MAC, upper-case dashes: hit" "dev 0A-1B-2C-3D-4E""-5F end" 1 '^FAIL  MAC address'
+rule "MAC, dotted: hit" "dev 0a1b.2c3d"".4e5f end" 1 '^FAIL  MAC address'
+rule "MAC, one separator only (mixed): exempt" "dev 0a-1b:2c-3d-4e-5f end" 0 '^ok    no public-scan hits'
+rule "MAC, all-zero dashes: exempt" "dev 00-00-00-00-00-00 end" 0 '^ok    no public-scan hits'
+rule "MAC, all-ff dashes: exempt" "dev ff-ff-ff-ff-ff-ff end" 0 '^ok    no public-scan hits'
+rule "MAC, all-zero dotted: exempt" "dev 0000.0000.0000 end" 0 '^ok    no public-scan hits'
+rule "MAC, all-ff dotted: exempt" "dev ffff.ffff.ffff end" 0 '^ok    no public-scan hits'
+rule "MAC, all-zero colons: exempt" "dev 00:00:00:00:00:00 end" 0 '^ok    no public-scan hits'
+rule "MAC, five dashed octets: exempt" "dev 0a-1b-2c-3d-4e end" 0 '^ok    no public-scan hits'
+UP="://user"":"
+rule "URL password starting %s: hit" "see http${UP}%sabcd@host/x" 1 '^FAIL  credentials in URL'
+rule "URL password %s: exempt by length (under 4), not by a rule" "see http${UP}%s@host/x" 0 '^ok    no public-scan hits'
+rule "URL password starting \$: exempt" "see http${UP}\$PASSWORD@host/x" 0 '^ok    no public-scan hits'
+rule "compressed global IPv6, one group after ::: hit" "addr 2a01""::1 end" 1 '^FAIL  IPv6 address'
+rule "compressed ULA IPv6, one group after ::: hit" "addr fd12""::1 end" 1 '^FAIL  IPv6 address'
+rule "documentation IPv6 compressed: exempt" "addr 2001:db8""::1 end" 0 '^ok    no public-scan hits'
+rule "a time of day: exempt" "at 23:59:59 and 12:30" 0 '^ok    no public-scan hits'
+rule "slice name[N::M]: exempt" "x = log[3600""::60] end" 0 '^ok    no public-scan hits'
+rule "slice arr[N::M]: exempt" "arr[2000""::2]" 0 '^ok    no public-scan hits'
+rule "slice after a dot call: exempt" "df.iloc[fd00""::5]" 0 '^ok    no public-scan hits'
+rule "slice after ): exempt" "f(x)[2000""::2]" 0 '^ok    no public-scan hits'
+rule "bracketed URL literal, short IPv6: hit" "http://[2a01""::1]:443/" 1 '^FAIL  IPv6 address'
+rule "bracket after a space, short IPv6: hit" "list [2a01""::1] end" 1 '^FAIL  IPv6 address'
+rule "MAC, dotted, digits only: exempt" "dev 1234.5678.9012 end" 0 '^ok    no public-scan hits'
+rule "date-like dotted digits: exempt" "at 2023.0412.1530 end" 0 '^ok    no public-scan hits'
+rule "MAC, dotted with letters: hit" "dev abcd.ef01"".2345 end" 1 '^FAIL  MAC address'
+rule "MAC, dotted, one letter group: hit" "dev 0050.56ab"".3456 end" 1 '^FAIL  MAC address'
+rule "MAC, dotted, upper case: hit" "dev ABCD.EF01"".2345 end" 1 '^FAIL  MAC address'
+rule "four hex digits and ::, no group after: exempt" "addr 2a01""::" 0 '^ok    no public-scan hits'
+rule "IPv4 after letters: accepted miss" "ip$NET.7 end" 0 '^ok    no public-scan hits'
+rule "IPv4 after an underscore: hit" "scan_$NET.7 end" 1 '^FAIL  IPv4 address'
+rule "IPv4 before letters: hit" "took $NET.7ms" 1 '^FAIL  IPv4 address'
+rule "package version 0ubuntu: exempt" "libssl3 3.0.13-0ubuntu0.24.04.2 amd64" 0 '^ok    no public-scan hits'
+rule "version after v: exempt" "tag v1.2.3.4 end" 0 '^ok    no public-scan hits'
+rule "version after python3: exempt" "python3.12.3.1 end" 0 '^ok    no public-scan hits'
+rule "version after V: exempt" "firmware V4.6.3.0 end" 0 '^ok    no public-scan hits'
+rule "IPv4 before an underscore: hit" "file $NET.7_bak" 1 '^FAIL  IPv4 address'
+rule "IPv4 at a sentence end: hit" "see $NET.7." 1 '^FAIL  IPv4 address'
+rule "five dotted numbers: exempt" "version 1.2.3.4.5 end" 0 '^ok    no public-scan hits'
+rule "address inside a longer digit run: exempt" "id 1$NET.77 end" 0 '^ok    no public-scan hits'
+rule "loopback: exempt" "bind 127.0.0.1 and 0.0.0.0" 0 '^ok    no public-scan hits'
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

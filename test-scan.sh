@@ -47,6 +47,9 @@
 #      layout (scan.sh and git-hooks/ outside the scanned repo)
 #   21 type changes (T) are scanned: a T-only commit with a token is refused, a
 #      T .py with F821 is linted, a deletion-only commit is clean (0 files)
+#   22g-22l the config's global path allowlist is dropped: a token in
+#      node_modules, an .svg or a lockfile is refused; a config with no paths
+#      key works; one that does not parse or has an [extend] is exit 2; an allowlist of only paths is dropped whole
 #   22 gitleaks reads raw blobs: -diff, binary and UTF-16 working-tree-encoding
 #      cannot hide a token (--staged and --all); a tracked root .gitleaksignore
 #      holding its fingerprint does not suppress it
@@ -474,6 +477,95 @@ expect "22e2 the same, --all: refuses" 1 's\.txt:1: github-pat'
 # The .gitleaksignore file is itself scanned, under its real name.
 mkrepo; put .gitleaksignore "token = \"ghp_${SECRET_TAIL}\""$'\n'; scan --staged
 expect "22f a token inside .gitleaksignore is reported under that name" 1 '(^|[^.a-z])\.gitleaksignore:1: github-pat' 'gitleaksignore\.content'
+
+# 22g-22m: the release config's global path allowlist (node_modules, images,
+# lockfiles) must not hide a token: scan.sh drops it from a temp copy of the
+# config. 2026-11-08 audit run 3, finding 1.
+for p in plain.txt node_modules/pkg/x.js logo.svg package-lock.json; do
+  mkrepo; put "$p" "$TOKTXT"; scan --staged
+  expect "22g $p holding a token: --staged refuses" 1 "$(printf '%s' "$p" | sed 's/\./\\./g'):1: github-pat" "$SECRET_TAIL"
+done
+mkrepo; put node_modules/pkg/x.js "$TOKTXT"; commit --no-verify; scan --all
+expect "22h node_modules/pkg/x.js, --all: refuses" 1 'node_modules/pkg/x\.js:1: github-pat'
+mkrepo; put node_modules/pkg/x.js "$TOKTXT"; commit
+expect "22h2 through the hook: refused" 1 'node_modules/pkg/x\.js:1: github-pat'
+# Config variants, written here from the release config.
+GLV=$TMP/glvariants; mkdir "$GLV"
+python3 -I -c 'import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+i = s.index("[allowlist]")
+a = s.index("paths = [", i)
+b = s.index("\n]\n", a)
+open(sys.argv[2], "w", encoding="utf-8").write(s[:a] + s[b + 3:])
+open(sys.argv[3], "w", encoding="utf-8").write(s[:i] + "[[allowlists]]" + s[i + 11:])' \
+  "$GATES_GITLEAKS_CONFIG" "$GLV/nopaths.toml" "$GLV/plural.toml" || exit 2
+if grep -q 'node_modules' "$GLV/nopaths.toml"; then bad "22i0 fixture" "paths key still in the no-paths config"; fi
+mkrepo; put notes.txt "$TOKTXT"; GATES_GITLEAKS_CONFIG=$GLV/nopaths.toml scan --staged
+expect "22i a config with no paths key still works: refuses" 1 'notes\.txt:1: github-pat'
+mkrepo; put notes.txt $'nothing here\n'; GATES_GITLEAKS_CONFIG=$GLV/nopaths.toml scan --staged
+expect "22i2 the same config, a clean file: succeeds" 0 'scan: clean'
+mkrepo; put node_modules/pkg/x.js "$TOKTXT"; GATES_GITLEAKS_CONFIG=$GLV/plural.toml scan --staged
+expect "22j a [[allowlists]] form with paths: node_modules token refused" 1 'node_modules/pkg/x\.js:1: github-pat'
+mkrepo; put notes.txt "$TOKTXT"; printf 'this is [ not = toml\n' >"$GLV/bad.toml"
+GATES_GITLEAKS_CONFIG=$GLV/bad.toml scan --staged
+expect "22k a config that does not parse: exit 2" 2 'cannot make the gitleaks config' 'scan: clean'
+mkrepo; put notes.txt "$TOKTXT"; printf '[allowlist]\nregexes = ["a"]\n[[rules]]\nid = "x"\nregex = "y"\npaths = [\n' >"$GLV/trunc.toml"
+GATES_GITLEAKS_CONFIG=$GLV/trunc.toml scan --staged
+expect "22l a truncated config: exit 2" 2 'cannot make the gitleaks config' 'scan: clean'
+
+mkrepo; put notes.txt "$TOKTXT"; printf "[extend]\nuseDefault = true\n" >"$GLV/extend.toml"
+GATES_GITLEAKS_CONFIG=$GLV/extend.toml scan --staged
+expect "22m a config with [extend] useDefault: exit 2" 2 "cannot make the gitleaks config.*\[extend\]" "scan: clean"
+# An [allowlist] holding only paths: gitleaks refuses the emptied table, so
+# the edit drops it whole.
+printf "[[rules]]\nid = \"tok\"\nregex = \x27\x27\x27ghp_[A-Za-z0-9]{36}\x27\x27\x27\n[allowlist]\ndescription = \"d\"\npaths = [\n    \x27\x27\x27node_modules\x27\x27\x27,\n]\n[[rules]]\nid = \"other\"\nregex = \x27\x27\x27zzzq\x27\x27\x27\n" >"$GLV/onlypaths.toml"
+mkrepo; put node_modules/pkg/x.js "$TOKTXT"; GATES_GITLEAKS_CONFIG=$GLV/onlypaths.toml scan --staged
+expect "22n an [allowlist] holding only paths: dropped, node_modules token refused" 1 "node_modules/pkg/x\.js:1: tok"
+
+# 22o-22s: gitleaks reads TOML keys case-insensitively, so the edit does too;
+# an AND allowlist loses its whole table; an emptied array is no check.
+glcase() { # name, config (printf format): token in node_modules/p/x.js
+  mkrepo; put node_modules/p/x.js "$TOKTXT"; printf "$2" >"$GLV/$1.toml"
+  GATES_GITLEAKS_CONFIG=$GLV/$1.toml scan --staged
+}
+RULE="[[rules]]\nid = \"tok\"\nregex = '''ghp_[A-Za-z0-9]{36}'''\n"
+glcase case1 "${RULE}[Allowlist]\npaths = ['''node_modules''']\nregexes = ['''zzzq''']\n"
+expect "22o [Allowlist] + paths: node_modules token refused" 1 'node_modules/p/x\.js:1: tok'
+glcase case2 "${RULE}[allowlist]\nPaths = ['''node_modules''']\nregexes = ['''zzzq''']\n"
+expect "22o2 [allowlist] + Paths: refused" 1 'node_modules/p/x\.js:1: tok'
+glcase case3 "${RULE}[[AllowLists]]\npaths = ['''node_modules''']\nregexes = ['''zzzq''']\n"
+expect "22o3 [[AllowLists]]: refused" 1 'node_modules/p/x\.js:1: tok'
+glcase case4 "${RULE}[allowList]\nPATHS = ['''node_modules''']\nregexes = ['''zzzq''']\n"
+expect "22o4 [allowList] + PATHS: refused" 1 'node_modules/p/x\.js:1: tok'
+glcase case5 "${RULE}[Extend]\nuseDefault = true\n"
+expect "22p [Extend]: exit 2" 2 'cannot make the gitleaks config.*\[extend\]' 'scan: clean'
+# AND: "path AND regex" must not become "regex anywhere".
+glsrc() { # name, config (printf format): token in src/a.txt
+  mkrepo; put src/a.txt "$TOKTXT"; printf "$2" >"$GLV/$1.toml"
+  GATES_GITLEAKS_CONFIG=$GLV/$1.toml scan --staged
+}
+glsrc and1 "${RULE}[[allowlists]]\ncondition = \"AND\"\npaths = ['''^test/''']\nregexes = ['''ghp_''']\n"
+expect "22q AND [[allowlists]] with paths: token in src/a.txt refused" 1 'src/a\.txt:1: tok'
+glsrc and2 "${RULE}[[allowlists]]\npaths = ['''^test/''']\nregexes = ['''ghp_''']\ncondition = \"and\"\n"
+expect "22q2 condition after the keys, lower case: refused" 1 'src/a\.txt:1: tok'
+glsrc and3 "${RULE}[allowlist]\nCondition = 'AND'\nPaths = ['''^test/''']\nstopwords = ['''ghp_''']\n"
+expect "22q3 [allowlist] AND, mixed-case keys: refused" 1 'src/a\.txt:1: tok'
+glsrc or1 "${RULE}[[allowlists]]\npaths = ['''^test/''']\nregexes = ['''ghp_''']\n"
+expect "22q4 an OR table keeps its regexes: token suppressed" 0 'scan: clean'
+# Empty arrays are no check: the table is dropped whole and gitleaks loads.
+glsrc empty1 "${RULE}[[allowlists]]\npaths = ['''^test/''']\nregexes = []\n"
+expect "22r paths + regexes = []: loads, token refused" 1 'src/a\.txt:1: tok' 'cannot make|rror'
+# The release config comes out as the original minus allowlist.paths.
+python3 -I -c 'import re, sys
+s = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"^gl_cfg=\x27\n(.*?)^\x27$", s, re.S | re.M)
+open(sys.argv[2], "w", encoding="utf-8").write(m.group(1))' "$SELF/scan.sh" "$GLV/gl_cfg.py" || exit 2
+python3 -I "$GLV/gl_cfg.py" "$GATES_GITLEAKS_CONFIG" "$GLV/release.toml" || bad "22s gl_cfg on the release config" "failed"
+python3 -I -c 'import sys, tomllib
+a = tomllib.load(open(sys.argv[1], "rb"))
+b = tomllib.load(open(sys.argv[2], "rb"))
+a["allowlist"].pop("paths")
+sys.exit(0 if a == b else 1)' "$GATES_GITLEAKS_CONFIG" "$GLV/release.toml" && ok "22s release config: the original minus allowlist.paths" || bad "22s release config" "not the original minus allowlist.paths"
 
 # 23 --------------------------------------------------------------------
 # --deps must not run a venv that git tracks (its bin/python would run).

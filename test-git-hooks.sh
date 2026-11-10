@@ -444,7 +444,7 @@ ppssh "alias for github.com, public: refused, checker called" 1 'o/r is public' 
 ppssh "alias for github.com, private: allowed, checker called" 0 '' git@gh-work:o/r.git private GitHub.com. 'o r'
 ppssh "ssh:// alias for github.com, public: refused"          1 'o/r is public' ssh://git@gh-work/o/r.git public github.com 'o r'
 ppssh "alias for another host: allowed with a note"           0 'not checked: host example.net is not GitHub' git@gh-work:o/r.git public example.net ''
-ppssh "ssh -G prints no hostname: allowed with a note"        0 'not checked: host gh-work is not GitHub' git@gh-work:o/r.git public '' ''
+ppssh "ssh -G prints an empty hostname: unknown, refused"     1 'ssh -G gh-work failed \(no hostname in its output\); host treated as unknown' git@gh-work:o/r.git public '' ''
 ppssh "https URL on another host: note, ssh not run"          0 'not checked: host example.com is not GitHub' https://example.com/o/r.git public github.com ''
 if [ ! -s "$SSH_ARGV" ]; then ok "https host is never resolved through ssh"; else bad "https host is never resolved" "ssh argv: $(cat "$SSH_ARGV")"; fi
 ppssh "github.com via ssh: no resolution needed"              0 '' git@github.com:o/r.git private example.net 'o r'
@@ -468,6 +468,50 @@ if [ "$(cat "$SSH_ARGV")" = "-G -- gh-work" ]; then ok "ssh is run as: ssh -G --
 ppssh "local path: no note"                                    0 - /srv/x/repo.git public github.com ''
 ppssh "relative local path: no note"                           0 - ./repo.git public github.com ''
 rm -f "$SSH_ARGV"
+
+# ssh -G failing closed: a failed resolution is unknown (scanned, refused
+# unless approved), never "not GitHub". ppfail NAME WANT_RC PATTERN GATES_SSH [APPROVE]
+ppfail() {
+  local name=$1 want=$2 pat=$3 sshbin=$4 appr=${5:-} rc err
+  : >"$LOG"
+  err=$(STUB_WORD=public STUB_RC=0 GATES_SSH=$sshbin GATES_CHECK_VISIBILITY=$STUB GATES_PUBLIC_PUSH_OK=$appr \
+    "$HOOKS/pre-push" origin git@gh-work:o/r.git </dev/null 2>&1 >/dev/null); rc=$?
+  if [ "$rc" -ne "$want" ]; then bad "$name" "rc=$rc, want $want; stderr: $err"; return; fi
+  if ! printf '%s' "$err" | grep -Eq -- "$pat"; then bad "$name" "stderr lacks /$pat/: $err"; return; fi
+  if printf '%s' "$err" | grep -q 'not checked'; then bad "$name" "printed 'not checked': $err"; return; fi
+  if [ -s "$LOG" ]; then bad "$name" "checker was called: $(cat "$LOG")"; return; fi
+  ok "$name"
+}
+FAILSTUB="$TMP/stub-ssh-fail"
+printf '#!/bin/sh\nexit 255\n' >"$FAILSTUB"; chmod +x "$FAILSTUB"
+NOHNSTUB="$TMP/stub-ssh-nohn"
+printf '#!/bin/sh\nprintf "user git\\nport 22\\n"\n' >"$NOHNSTUB"; chmod +x "$NOHNSTUB"
+HANGSTUB="$TMP/stub-ssh-hang"
+printf '#!/bin/sh\nsleep 30\n' >"$HANGSTUB"; chmod +x "$HANGSTUB"
+ppfail "ssh -G exits non-zero, no output: unknown, refused, line printed" 1 'pre-push: ssh -G gh-work failed \(exit status 255\); host treated as unknown' "$FAILSTUB"
+ppfail "ssh -G exits non-zero: refused as unknown (target ?/?)" 1 'is unknown, not private' "$FAILSTUB"
+ppfail "ssh -G exits non-zero, GATES_PUBLIC_PUSH_OK=yes: allowed as the unknown path is" 0 'push to \?/\? \(unknown\) is approved by GATES_PUBLIC_PUSH_OK=yes' "$FAILSTUB" yes
+ppfail "ssh -G exits non-zero, approval =1: refused" 1 'is unknown, not private' "$FAILSTUB" 1
+ppfail "GATES_SSH names a program not on PATH (127): unknown, refused" 1 'failed \(not found\); host treated as unknown' no-such-ssh-g-binary
+ppfail "ssh -G exits 0 with no hostname line: unknown, refused" 1 'failed \(no hostname in its output\); host treated as unknown' "$NOHNSTUB"
+if command -v timeout >/dev/null 2>&1; then
+  t0=$SECONDS
+  ppfail "ssh -G hangs: timed out, unknown, refused" 1 'failed \(timed out after 5 s\); host treated as unknown' "$HANGSTUB"
+  if [ $((SECONDS - t0)) -le 7 ]; then ok "ssh -G hang returned within the 5 s timeout ($((SECONDS - t0)) s)"; else bad "ssh -G hang took too long" "$((SECONDS - t0)) s"; fi
+else
+  echo "SKIP: ssh -G hang cases (timeout not installed)"
+fi
+# same failure through git: nothing arrives
+sc_new git@gh-work:o/r.git
+sc_commit ff1 "fail closed commit"
+rc=0
+err=$(STUB_WORD=private STUB_RC=0 GATES_SSH=$FAILSTUB GATES_CHECK_VISIBILITY=$STUB git -C "$SC" push gh main 2>&1) || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$err" | grep -q 'host treated as unknown' && ! sc_arrived main; then
+  ok "git push with ssh -G failing: refused, nothing arrives"
+else bad "git push with ssh -G failing" "rc=$rc: $err"; fi
+# regression: success is unchanged
+ppssh "ssh -G ok, hostname github.com, public: refused as before" 1 'o/r is public' git@gh-work:o/r.git public github.com 'o r'
+ppssh "ssh -G ok, hostname example.net: note and allowed as before" 0 'not checked: host example.net is not GitHub' git@gh-work:o/r.git public example.net ''
 
 # through git: an alias for github.com whose checker answers public is refused
 # and nothing arrives; the alias for another host goes through with a note

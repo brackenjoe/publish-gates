@@ -43,8 +43,11 @@
 # name, it is resolved with `ssh -G -- HOST` (bounded by `timeout 5` when
 # available; it connects to nothing, it only evaluates ssh config) and the
 # first "hostname" line is used, so a Host alias for github.com is judged as
-# GitHub. A host beginning with "-" is never passed to ssh. A host that is
-# still not GitHub (another host) passes, after one stderr line
+# GitHub. If ssh -G exits non-zero (a bad config, a timeout, ssh not found) or
+# prints no hostname, the host is unknown: a stderr line says so and it takes
+# the unknown path below (ssh -G also runs any `Match exec` in the config, so
+# a slow one can time out). A host beginning with "-" is never passed to ssh.
+# A host that is still not GitHub (another host) passes, after one stderr line
 # "pre-push: not checked: host HOST is not GitHub"; a local path passes
 # silently. A host that has a character outside [a-z0-9.-] (a %XX escape,
 # which git decodes in URL-form hosts, an IPv6 literal, an underscore) is not
@@ -106,8 +109,12 @@ target_commits() {
         git cat-file --batch-check 2>/dev/null | awk '$2 == "commit" {print $1}'
 }
 
-# resolve_ssh_host HOST: prints the lowercased "hostname" ssh -G reports, or
-# nothing. A host starting with "-" is never passed to ssh.
+# resolve_ssh_host HOST: prints the lowercased "hostname" ssh -G reports and
+# returns 0; prints nothing and returns 0 for a host starting with "-" or an
+# empty one (never passed to ssh). If ssh -G fails it prints nothing and
+# returns its exit status (124 timeout, 127 not found); if it exits 0 without
+# a non-empty "hostname" line it returns 253. The caller treats any non-zero
+# as unknown, not as "not GitHub".
 resolve_ssh_host() {
     case $1 in
     -* | '') return 0 ;;
@@ -117,7 +124,11 @@ resolve_ssh_host() {
     else
         _g=$("${GATES_SSH:-ssh}" -G -- "$1" 2>/dev/null </dev/null)
     fi
-    printf '%s\n' "$_g" | awk '$1 == "hostname" {print tolower($2); exit}' | sed 's/\.*$//'
+    _grc=$?
+    [ "$_grc" -eq 0 ] || return "$_grc"
+    _gh=$(printf '%s\n' "$_g" | awk '$1 == "hostname" {print tolower($2); exit}' | sed 's/\.*$//')
+    [ -n "$_gh" ] || return 253
+    printf '%s\n' "$_gh"
 }
 
 # scan_push: reads the ref lines on stdin; prints each offending commit to
@@ -207,8 +218,22 @@ github.com | www.github.com | ssh.github.com | gist.github.com) ;;
 *)
     if [ "$viassh" -eq 1 ] && [ -n "$host" ]; then
         resolved=$(resolve_ssh_host "$host")
-        # the name ssh will contact is the one to judge, alias or not
-        [ -z "$resolved" ] || host=$resolved
+        rrc=$?
+        if [ "$rrc" -ne 0 ]; then
+            # ssh -G failed: the name ssh would contact is unknown, so the
+            # alias is not judged "not GitHub"; same path as an odd host
+            case $rrc in
+            124) why='timed out after 5 s' ;;
+            127) why='not found' ;;
+            253) why='no hostname in its output' ;;
+            *) why="exit status $rrc" ;;
+            esac
+            odd=1
+            echo "pre-push: ssh -G $host failed ($why); host treated as unknown (fix the ssh config, or set GATES_SSH=PATH to the ssh that resolves it)" >&2
+        else
+            # the name ssh will contact is the one to judge, alias or not
+            [ -z "$resolved" ] || host=$resolved
+        fi
     fi
     case $host in
     github.com | www.github.com | ssh.github.com | gist.github.com) ;;

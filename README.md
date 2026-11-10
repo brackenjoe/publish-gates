@@ -204,11 +204,14 @@ The host counts as GitHub when it is `github.com`, `www.github.com`,
 For the scp-like and `ssh://` forms (`git+ssh://` and `ssh+git://` too), a
 host that is not already one of those names is resolved as an ssh `Host`
 alias, to its `HostName` from `ssh -G` (which reads ssh config and connects
-to nothing); `GATES_SSH=PATH` replaces ssh (the test stubs it). Only the
+to nothing); `GATES_SSH=PATH` replaces ssh (the test stubs it). If `ssh -G`
+fails, times out after 5 s, is not found or prints no `hostname`, the host
+is unknown and the push is refused unless approved; stderr says which, and
+the remedy is the ssh config or `GATES_SSH`, not the approval. Only the
 default ssh config is read: if git is pointed at another one
 (`core.sshCommand`, `GIT_SSH_COMMAND` or `GIT_SSH` with `-F FILE`, or another
 program), an alias defined only there is not resolved and passes as not
-checked. A gist push is
+checked, unless `ssh -G` itself fails. A gist push is
 refused unless approved, since the checker judges repos, not gists. So is a
 push whose host, after that resolution (the alias's `HostName` when it has
 one), holds a character outside
